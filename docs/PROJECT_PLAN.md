@@ -39,10 +39,11 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 
 ### M2 Executor, config and test support - walking skeleton (L) - FR-1, FR-13
 - `Config`, `shard.Open` (validate registry + bucket map, ping all shards), `Close`, `Health`.
-- `exec`: one `*sql.DB` per shard, single-shard `Run`, per-shard timeout, fan-out semaphore (not yet used for merging).
-- `Querier` interface; `*shard.DB` implements it.
-- `shardtest.NewCluster` (testcontainers, plus `SHARDTEST_DSNS` mode), `Seed`.
-- `examples/quickstart` (static key lookup with a hand-built `Analysis` until M3).
+- `exec`: one `*sql.DB` per shard, parallel `Query` (fail-fast) and `Exec` (best-effort) with per-shard timeout and a `MaxFanout` bound.
+- Routing in M2 is explicit (`WithShardKey`, `WithShard`, `WithAllShards`); the analyzer in M3 makes it automatic.
+- `Querier` interface (`Query`, `Exec`); `*shard.DB` implements it. `Begin` and `Explain` are added in M5 and M7.
+- `shardtest.NewCluster` (testcontainers, plus `SHARDTEST_DSNS` mode), `Seed`, and helpers to assert where a row physically is.
+- `examples/quickstart` (explicit `WithShardKey` routing until M3).
 - **Done when:** an integration test inserts and reads a row by key across a 3-shard cluster, and the row is physically on the shard the router chose.
 
 ### M3 Analyzer (L) - FR-4

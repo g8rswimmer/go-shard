@@ -15,10 +15,21 @@ Start with the design docs: [requirements](docs/REQUIREMENTS.md),
 make help              # list all targets
 make test              # unit tests with the race detector (no Docker)
 make up                # start 3 local Postgres shards (ports 5441-5443)
-make test-integration  # integration tests (needs Docker)
+make test-integration  # integration tests; starts its own Postgres containers (needs Docker)
 make lint              # golangci-lint
 make down              # stop the shards and delete their data
 ```
+
+Integration tests start throwaway Postgres containers per test. To reuse the
+shards from `make up` instead (faster, and what CI does):
+
+```sh
+make up
+make test-integration-compose
+```
+
+This **wipes the `public` schema** of those databases and runs one package at a
+time (`-p 1`), because the packages share the same databases.
 
 Set `POSTGRES_VERSION` to run the shards on another version (default 14, the
 oldest supported):
