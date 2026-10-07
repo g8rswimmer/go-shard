@@ -17,6 +17,10 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64.8
+          # The prebuilt binary is compiled with an older Go than go.mod
+          # targets and refuses to load the module. Build it with the Go
+          # that setup-go installed instead.
+          install-mode: goinstall
 
   test:
     runs-on: ubuntu-latest
