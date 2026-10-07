@@ -33,7 +33,7 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 
 ### M1 Registry and router (M) - FR-2, FR-3
 - `registry`: `Sharded`, `Colocated`, `Global`, `Validate()` (missing parent, cycles, key type mismatch).
-- `router`: key canonicalization (int, uuid, string), xxhash64, 1024 buckets, bucket-map validation, `ShardFor` / `ShardsFor` / `All`.
+- `router`: key canonicalization (int, uuid, string), xxhash64, 1024 buckets, bucket-map validation, `ShardFor` / `ShardsFor` / `All`, and an `Even` helper that splits buckets across shards.
 - Fixed hash test vectors so the hash can never change silently.
 - **Done when:** unit tests cover all validation errors; vectors pass; bucket map with a gap or overlap is rejected.
 
