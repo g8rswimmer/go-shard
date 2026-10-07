@@ -72,21 +72,29 @@ Small interfaces sit at the seams that are expected to change.
 
 ```go
 // registry
-type TableKind int // Sharded, Colocated, Global
+type Kind int // KindSharded, KindColocated, KindGlobal
 type Table struct {
-    Name     string
-    Kind     TableKind
-    KeyCol   string // empty for Global
-    Parent   string // for Colocated
-    Group    string // colocation group, derived from root parent
+    Name    string
+    Kind    Kind
+    KeyCol  string  // empty for Global
+    KeyType KeyType // optional; inherited from the root table
+    Parent  string  // for Colocated
+    Group   string  // colocation group: the root sharded table's name
 }
-type Registry interface {
-    Table(name string) (Table, bool)
-    Validate() error
-}
+// Immutable. New validates every declaration and returns all problems at once.
+func New(decls ...Decl) (*Registry, error)
+func (r *Registry) Table(name string) (Table, bool)
+func (r *Registry) Tables() []Table // sorted by name
 
 // router
 type ShardID string
+type BucketRange struct{ From, To int } // inclusive
+type Assignment struct {
+    Shard   ShardID
+    Buckets []BucketRange
+}
+func New(assignments ...Assignment) (*HashRouter, error) // validates the bucket map
+func Even(ids ...ShardID) []Assignment                   // near-equal contiguous split
 type Router interface {
     ShardFor(key any) (ShardID, error)       // canonicalize, hash, bucket, shard
     ShardsFor(keys []any) ([]ShardID, error)
@@ -173,13 +181,17 @@ Joins are allowed only if every non-global table is in the same colocation group
 
 ### 5.1 Registry (FR-2)
 
-- Built in code at startup (`registry.Sharded`, `Colocated`, `Global`).
-- `Validate()` checks the parent exists, key columns are declared, there are no cycles, and a colocated table uses the same key type as its root. Group is the root ancestor's name.
-- Immutable after `Open`, so it is safe for concurrent use without locks.
+- Built in code at startup: `registry.New(registry.Sharded(...), registry.Colocated(...), registry.Global(...))`.
+- `New` validates and returns every problem at once: missing key, missing or global parent, cycles, global tables with options, duplicate names, and a colocated table whose declared key type differs from its root's. Group is the root ancestor's name.
+- A colocated table's key column may have a different name from its parent's (for example `profiles.id` and `addresses.profile_id`).
+- Immutable once built, so it is safe for concurrent use without locks. There is no separate `Validate()` call.
+- Names are matched exactly as declared; declare them in lower case, as PostgreSQL folds unquoted identifiers.
 
 ### 5.2 Router (FR-3)
 
-- **Canonical key bytes:** integers as 8-byte big-endian `int64`, UUIDs as their 16 bytes, strings as UTF-8. Stable across restarts and versions, and unit-tested with fixed vectors.
+- **Canonical key bytes:** a one-byte type tag, then the value. Integers (any width) as 8-byte big-endian `int64`, UUIDs as their 16 bytes, strings as UTF-8. Stable across restarts and versions, and pinned by test vectors computed with an independent xxhash64 implementation.
+- **UUIDs:** a `[16]byte` and a string in canonical 8-4-4-4-12 form (any letter case) route to the same shard, so it does not matter whether the caller holds the UUID as bytes or text. Other string layouts are ordinary strings.
+- **Rejected keys:** nil, unsigned values above `MaxInt64`, and unsupported types (floats, bools, byte slices, structs) return errors rather than guessing.
 - **Hash:** `xxhash64(canonical) % 1024` gives a bucket.
 - **Bucket map:** config lists bucket ranges per shard. Startup validation requires every bucket in `[0,1024)` to be assigned exactly once.
 - The bucket count is fixed so that adding resharding later moves buckets, not every key.
