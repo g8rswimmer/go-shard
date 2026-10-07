@@ -1,0 +1,26 @@
+# Three local PostgreSQL shards for examples, the demo and integration tests.
+# POSTGRES_VERSION defaults to the minimum supported version.
+name: go-shard
+
+x-shard: &shard
+  image: postgres:${POSTGRES_VERSION:-14}
+  environment:
+    POSTGRES_USER: shard
+    POSTGRES_PASSWORD: shard
+    POSTGRES_DB: shard
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U shard -d shard"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  shard-01:
+    <<: *shard
+    ports: ["5441:5432"]
+  shard-02:
+    <<: *shard
+    ports: ["5442:5432"]
+  shard-03:
+    <<: *shard
+    ports: ["5443:5432"]
