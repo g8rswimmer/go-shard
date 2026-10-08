@@ -1,8 +1,8 @@
 # Quickstart
 
-Shows the basics: describe your tables, open the shards, write a row to the
-shard that owns its key, then read and update it with plain SQL. The library
-finds the shard from the shard key in the SQL.
+Shows the basics: describe your tables, open the shards, then write, read and
+update rows with plain SQL. The library finds the shard from the shard key in
+the SQL.
 
 ```sh
 make up                              # three local Postgres shards
@@ -25,14 +25,14 @@ refused: shard: no shard key: the query on "profiles" does not say which shard i
 
 What to notice:
 
-- **Reads and updates need no hints.** `SELECT ... WHERE id = $1` and
-  `UPDATE ... WHERE id = $1` run on the shard that owns the id, because the
-  library reads the shard key from the `WHERE` clause.
-- **Inserts still name the key** with `db.WithShardKey(id)`. Routing an INSERT
-  from its `VALUES` arrives in a later milestone.
+- **No shard is ever named.** `INSERT ... VALUES ($1, ...)`, `SELECT ... WHERE id = $1`
+  and `UPDATE ... WHERE id = $1` run on the shard that owns the id, because the
+  library reads the shard key from the statement.
 - **A statement that does not say where it belongs is refused**, not guessed.
   The last line shows the error, which says how to fix it.
 - **The key type is required** (`registry.Type(registry.KeyInt)`). Keys are
   converted to it before routing, so the number 42 and the text "42" go to the
   same shard.
 - `WithAllShards()` runs a statement on every shard, used here to create the table.
+
+Next: [writes](../writes) shows batches, partial failure and safe retries.

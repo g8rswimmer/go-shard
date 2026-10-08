@@ -3,11 +3,14 @@
 package shard
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/g8rswimmer/go-shard/plan"
+	"github.com/g8rswimmer/go-shard/query"
 )
 
 func TestDefaultAnalyzerRoutesRawSQL(t *testing.T) {
@@ -16,7 +19,7 @@ func TestDefaultAnalyzerRoutesRawSQL(t *testing.T) {
 	}
 	db := autoDB(t, defaultAnalyzer(), "a", "b", "c")
 	run := func(sql string, args ...any) (plan.Plan, error) {
-		return (&scoped{db: db}).plan(sql, args, db.analyzeNow(sql, args))
+		return (&scoped{db: db}).plan((&scoped{db: db}).sqlRequest(sql, args))
 	}
 
 	t.Run("by key", func(t *testing.T) {
@@ -62,7 +65,7 @@ func TestDefaultAnalyzerRoutesRawSQL(t *testing.T) {
 
 	t.Run("an explicit route overrides the SQL", func(t *testing.T) {
 		sql := "SELECT * FROM profiles WHERE id = $1 OR id = $2"
-		p, err := (&scoped{db: db, route: route{kind: routeByShard, shard: "c"}}).plan(sql, []any{1, 2}, db.analyzeNow(sql, []any{1, 2}))
+		p, err := (&scoped{db: db, route: route{kind: routeByShard, shard: "c"}}).plan((&scoped{db: db}).sqlRequest(sql, []any{1, 2}))
 		if err != nil || p.Targets[0] != "c" {
 			t.Errorf("plan = %+v, err %v; want shard c", p, err)
 		}
@@ -81,4 +84,78 @@ func TestDefaultAnalyzerRoutesRawSQL(t *testing.T) {
 			t.Errorf("error = %v", err)
 		}
 	})
+}
+
+// A multi-row INSERT is routed by row and each shard gets only its own rows,
+// whether it arrives as SQL or as a built statement.
+func TestMultiRowInsertIsSplitPerShard(t *testing.T) {
+	db := autoDB(t, defaultAnalyzer(), "a", "b", "c")
+	owner := func(id int) ShardID { s, _ := db.router.ShardFor(id); return s }
+
+	// Find ids on different shards.
+	ids := map[ShardID]int{}
+	for id := 1; len(ids) < 3; id++ {
+		if _, seen := ids[owner(id)]; !seen {
+			ids[owner(id)] = id
+		}
+	}
+	first, second := ids["a"], ids["b"]
+
+	sql := "INSERT INTO profiles (id, name) VALUES ($1, $2), ($3, $4), ($5, $6) RETURNING id"
+	args := []any{first, "x", second, "y", first, "z"}
+	p, err := (&scoped{db: db}).plan((&scoped{db: db}).sqlRequest(sql, args))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Targets) != 2 || len(p.PerShard) != 2 {
+		t.Fatalf("plan = %+v", p)
+	}
+
+	for shardID, rows := range map[ShardID][]string{"a": {"x", "z"}, "b": {"y"}} {
+		stmt := p.PerShard[shardID]
+		an, err := defaultAnalyzer().FromSQL(stmt.SQL, stmt.Args)
+		if err != nil {
+			t.Fatalf("shard %s: %v\n%s", shardID, err, stmt.SQL)
+		}
+		var names []string
+		for _, row := range an.Insert.Rows {
+			names = append(names, row[1].Value.(string))
+		}
+		if fmt.Sprint(names) != fmt.Sprint(rows) {
+			t.Errorf("shard %s receives rows %v, want %v", shardID, names, rows)
+		}
+		if !strings.Contains(stmt.SQL, "RETURNING") {
+			t.Errorf("shard %s lost its RETURNING clause: %s", shardID, stmt.SQL)
+		}
+	}
+	if fmt.Sprint(p.Rows["a"]) != "[0 2]" || fmt.Sprint(p.Rows["b"]) != "[1]" {
+		t.Errorf("rows = %v", p.Rows)
+	}
+
+	// The same through the builder.
+	st, err := query.InsertInto("profiles").Columns("id", "name").
+		Row(first, "x").Row(second, "y").Row(first, "z").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, err := (&scoped{db: db}).plan(statementRequest(st))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(bp.Rows) != fmt.Sprint(p.Rows) || len(bp.PerShard) != 2 {
+		t.Errorf("builder plan rows %v, want %v", bp.Rows, p.Rows)
+	}
+}
+
+func TestInsertThatChangesTheKeyIsRefusedBeforeRunning(t *testing.T) {
+	db := autoDB(t, defaultAnalyzer(), "a", "b")
+	for _, sql := range []string{
+		"UPDATE profiles SET id = 9 WHERE id = 1",
+		"INSERT INTO profiles (id, name) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET id = 2",
+	} {
+		_, err := db.Exec(context.Background(), sql)
+		if !errors.Is(err, ErrShardKeyImmutable) {
+			t.Errorf("%s: error = %v, want ErrShardKeyImmutable", sql, err)
+		}
+	}
 }

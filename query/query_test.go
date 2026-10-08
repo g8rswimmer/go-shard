@@ -40,6 +40,16 @@ func TestSelectSQL(t *testing.T) {
 			`UPDATE "profiles" SET "name" = $1, "age" = $2 WHERE "id" = $3`, []any{"x", 3, 42}},
 		{"delete", DeleteFrom("profiles").Where(Eq("id", 42)), `DELETE FROM "profiles" WHERE "id" = $1`, []any{42}},
 		{"delete everything", DeleteFrom("profiles"), `DELETE FROM "profiles"`, nil},
+		{"insert one row", InsertInto("profiles").Columns("id", "name").Row(1, "a"),
+			`INSERT INTO "profiles" ("id", "name") VALUES ($1, $2)`, []any{1, "a"}},
+		{"insert several rows", InsertInto("profiles").Columns("id", "name").Row(1, "a").Row(2, "b"),
+			`INSERT INTO "profiles" ("id", "name") VALUES ($1, $2), ($3, $4)`, []any{1, "a", 2, "b"}},
+		{"insert on conflict do nothing", InsertInto("t").Columns("id").Row(1).OnConflictDoNothing(),
+			`INSERT INTO "t" ("id") VALUES ($1) ON CONFLICT DO NOTHING`, []any{1}},
+		{"insert upsert", InsertInto("t").Columns("id", "name").Row(1, "a").OnConflictUpdate([]string{"id"}, "name"),
+			`INSERT INTO "t" ("id", "name") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name"`, []any{1, "a"}},
+		{"insert returning", InsertInto("t").Columns("id").Row(1).Returning("id", "name"),
+			`INSERT INTO "t" ("id") VALUES ($1) RETURNING "id", "name"`, []any{1}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,6 +137,13 @@ func TestBuildErrors(t *testing.T) {
 		{"update without set", Update("t"), "at least one Set"},
 		{"negative limit", From("t").Limit(-1), "Limit cannot be negative"},
 		{"negative offset", From("t").Offset(-1), "Offset cannot be negative"},
+		{"insert without columns", InsertInto("t").Row(1), "needs Columns"},
+		{"insert without rows", InsertInto("t").Columns("id"), "at least one Row"},
+		{"insert row of the wrong width", InsertInto("t").Columns("a", "b").Row(1, 2).Row(3), "row 1 has 1 values for 2 columns"},
+		{"insert with a bad column", InsertInto("t").Columns("a; DROP").Row(1), "not a valid identifier"},
+		{"upsert without a target", InsertInto("t").Columns("a").Row(1).OnConflictUpdate(nil, "a"), "conflict target"},
+		{"upsert without columns to set", InsertInto("t").Columns("a").Row(1).OnConflictUpdate([]string{"a"}), "at least one column to set"},
+		{"insert with a bad returning column", InsertInto("t").Columns("a").Row(1).Returning("x y"), "not a valid identifier"},
 		{"reports every problem", From("t").Columns("bad col").Where(In("id")).Limit(-1), "bad col"},
 	}
 	for _, tc := range tests {
@@ -143,5 +160,70 @@ func TestBuildErrors(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), w) {
 			t.Errorf("error should list every problem, missing %q: %v", w, err)
 		}
+	}
+}
+
+func TestInsertAnalysis(t *testing.T) {
+	a := mustBuild(t, InsertInto("public.profiles").Columns("name", "id").Row("a", 1).Row("b", 2).
+		OnConflictUpdate([]string{"id"}, "name")).Analysis()
+
+	if a.Op != analyze.OpInsert || a.Target != 0 || a.Tables[0].Schema != "public" || a.Tables[0].Name != "profiles" {
+		t.Errorf("op/target/table = %v %d %+v", a.Op, a.Target, a.Tables)
+	}
+	if a.Insert == nil || !reflect.DeepEqual(a.Insert.Columns, []string{"name", "id"}) || !reflect.DeepEqual(a.Insert.ConflictSet, []string{"name"}) {
+		t.Fatalf("insert = %+v", a.Insert)
+	}
+	want := [][]analyze.Cell{
+		{{Value: "a", Known: true}, {Value: 1, Known: true}},
+		{{Value: "b", Known: true}, {Value: 2, Known: true}},
+	}
+	if !reflect.DeepEqual(a.Insert.Rows, want) {
+		t.Errorf("rows = %+v, want %+v", a.Insert.Rows, want)
+	}
+}
+
+func TestUpdateAnalysisHasSetColumns(t *testing.T) {
+	a := mustBuild(t, Update("t").Set("a", 1).Set("b", 2).Where(Eq("id", 1))).Analysis()
+	if !reflect.DeepEqual(a.SetColumns, []string{"a", "b"}) {
+		t.Errorf("set columns = %v", a.SetColumns)
+	}
+}
+
+func TestSplitRows(t *testing.T) {
+	st := mustBuild(t, InsertInto("t").Columns("id", "name").Row(1, "a").Row(2, "b").Row(3, "c").OnConflictDoNothing())
+
+	sql, args, err := st.SplitRows([]int{2, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `INSERT INTO "t" ("id", "name") VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING`; sql != want {
+		t.Errorf("SQL = %s\nwant  %s", sql, want)
+	}
+	if !reflect.DeepEqual(args, []any{3, "c", 1, "a"}) {
+		t.Errorf("args = %v, want rows 2 then 0", args)
+	}
+
+	// Splitting does not disturb the statement.
+	if len(st.Args()) != 6 || !strings.Contains(st.SQL(), "($5, $6)") {
+		t.Errorf("the statement changed: %s %v", st.SQL(), st.Args())
+	}
+
+	for name, rows := range map[string][]int{"none": nil, "negative": {-1}, "past the end": {3}} {
+		if _, _, err := st.SplitRows(rows); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+	if _, _, err := mustBuild(t, From("t")).SplitRows([]int{0}); err == nil {
+		t.Error("only an INSERT can be split")
+	}
+}
+
+func TestInsertBuilderCanBeChangedAfterBuild(t *testing.T) {
+	b := InsertInto("t").Columns("id").Row(1)
+	first := mustBuild(t, b)
+	b.Row(2).Columns("id")
+	second := mustBuild(t, b)
+	if len(first.Args()) != 1 || len(second.Args()) != 2 || len(first.Analysis().Insert.Rows) != 1 {
+		t.Errorf("a built statement must not change when the builder does: %v / %v", first.Args(), second.Args())
 	}
 }

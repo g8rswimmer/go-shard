@@ -43,6 +43,7 @@ type Statement struct {
 	sql      string
 	args     []any
 	analysis analyze.Analysis
+	split    func(rows []int) (string, []any)
 }
 
 // SQL returns the statement text, with $1, $2, ... placeholders.
@@ -53,6 +54,26 @@ func (s Statement) Args() []any { return s.args }
 
 // Analysis describes the statement for routing.
 func (s Statement) Analysis() analyze.Analysis { return s.analysis }
+
+// SplitRows returns an INSERT with only the given rows (indexes into the rows
+// added with Row, in the order wanted) and the arguments it needs. It is how a
+// multi-row INSERT is sent to several shards, each receiving its own rows. It
+// fails for any statement that is not an INSERT.
+func (s Statement) SplitRows(rows []int) (string, []any, error) {
+	if s.split == nil {
+		return "", nil, errors.New("query: only an INSERT can be split into rows")
+	}
+	for _, r := range rows {
+		if r < 0 || r >= len(s.analysis.Insert.Rows) {
+			return "", nil, fmt.Errorf("query: row %d is out of range (the INSERT has %d rows)", r, len(s.analysis.Insert.Rows))
+		}
+	}
+	if len(rows) == 0 {
+		return "", nil, errors.New("query: no rows to keep")
+	}
+	sql, args := s.split(rows)
+	return sql, args, nil
+}
 
 // Cond is a condition in a WHERE clause. Build one with Eq, In and the others.
 type Cond struct {
@@ -321,6 +342,7 @@ func (b *UpdateBuilder) Build() (Statement, error) {
 	assigns := make([]string, len(b.sets))
 	for i, a := range b.sets {
 		assigns[i] = s.ident(a.col) + " = " + s.param(a.val)
+		s.analysis.SetColumns = append(s.analysis.SetColumns, a.col)
 	}
 	return s.finish("UPDATE " + s.table + " SET " + strings.Join(assigns, ", ") + s.whereSQL())
 }
@@ -347,4 +369,153 @@ func (b *DeleteBuilder) Where(conds ...Cond) *DeleteBuilder {
 func (b *DeleteBuilder) Build() (Statement, error) {
 	s := b.clone()
 	return s.finish("DELETE FROM " + s.table + s.whereSQL())
+}
+
+// ---- INSERT ----------------------------------------------------------------
+
+// InsertBuilder builds an INSERT ... VALUES.
+type InsertBuilder struct {
+	stmt
+	cols      []string
+	rows      [][]any
+	onConf    conflictKind
+	confTo    []string
+	confSet   []string
+	returning []string
+}
+
+type conflictKind int
+
+const (
+	noConflict conflictKind = iota
+	conflictDoNothing
+	conflictDoUpdate
+)
+
+// InsertInto starts an INSERT into a table, given as name or schema.name.
+func InsertInto(table string) *InsertBuilder {
+	b := &InsertBuilder{}
+	b.setTable(analyze.OpInsert, table)
+	return b
+}
+
+// Columns names the columns the rows give values for. It is required: the shard
+// key column must be among them, so the rows can be routed.
+func (b *InsertBuilder) Columns(cols ...string) *InsertBuilder { b.cols = cols; return b }
+
+// Row adds one row of values, in the order of Columns. Call it once per row; rows
+// whose keys belong to different shards are sent to their own shards.
+func (b *InsertBuilder) Row(values ...any) *InsertBuilder {
+	b.rows = append(b.rows, values)
+	return b
+}
+
+// OnConflictDoNothing adds ON CONFLICT DO NOTHING.
+func (b *InsertBuilder) OnConflictDoNothing() *InsertBuilder {
+	b.onConf = conflictDoNothing
+	return b
+}
+
+// OnConflictUpdate adds ON CONFLICT (target...) DO UPDATE SET col = EXCLUDED.col
+// for each column in set. Setting the shard key column is refused when the
+// statement is routed.
+func (b *InsertBuilder) OnConflictUpdate(target []string, set ...string) *InsertBuilder {
+	b.onConf, b.confTo, b.confSet = conflictDoUpdate, target, set
+	return b
+}
+
+// Returning adds RETURNING columns. Run such a statement with QueryStatement.
+func (b *InsertBuilder) Returning(cols ...string) *InsertBuilder { b.returning = cols; return b }
+
+// Build returns the statement, or an error naming every invalid input.
+func (b *InsertBuilder) Build() (Statement, error) {
+	s := b.clone()
+	if len(b.cols) == 0 {
+		s.fail("Insert needs Columns, so the shard key column can be found")
+	}
+	if len(b.rows) == 0 {
+		s.fail("Insert needs at least one Row")
+	}
+
+	cols := make([]string, len(b.cols))
+	for i, c := range b.cols {
+		cols[i] = s.ident(c)
+	}
+	for i, r := range b.rows {
+		if len(r) != len(b.cols) {
+			s.fail("row %d has %d values for %d columns", i, len(r), len(b.cols))
+		}
+	}
+
+	var tail string
+	switch b.onConf {
+	case conflictDoNothing:
+		tail = " ON CONFLICT DO NOTHING"
+	case conflictDoUpdate:
+		if len(b.confTo) == 0 || len(b.confSet) == 0 {
+			s.fail("OnConflictUpdate needs a conflict target and at least one column to set")
+		}
+		target := make([]string, len(b.confTo))
+		for i, c := range b.confTo {
+			target[i] = s.ident(c)
+		}
+		set := make([]string, len(b.confSet))
+		for i, c := range b.confSet {
+			set[i] = s.ident(c) + " = EXCLUDED." + s.ident(c)
+		}
+		tail = " ON CONFLICT (" + strings.Join(target, ", ") + ") DO UPDATE SET " + strings.Join(set, ", ")
+		s.analysis.Insert = &analyze.Insert{ConflictSet: slices.Clone(b.confSet)}
+	default:
+		// plain INSERT
+	}
+	if len(b.returning) > 0 {
+		r := make([]string, len(b.returning))
+		for i, c := range b.returning {
+			r[i] = s.ident(c)
+		}
+		tail += " RETURNING " + strings.Join(r, ", ")
+	}
+	if err := errors.Join(s.errs...); err != nil {
+		return Statement{}, fmt.Errorf("query: %w", err)
+	}
+
+	// Copy what the Statement keeps, so changing the builder later cannot change it.
+	rows := make([][]any, len(b.rows))
+	for i, r := range b.rows {
+		rows[i] = slices.Clone(r)
+	}
+	head := "INSERT INTO " + s.table + " (" + strings.Join(cols, ", ") + ") VALUES "
+	render := func(idx []int) (string, []any) {
+		var args []any
+		groups := make([]string, len(idx))
+		for g, i := range idx {
+			ph := make([]string, len(rows[i]))
+			for j, v := range rows[i] {
+				args = append(args, v)
+				ph[j] = fmt.Sprintf("$%d", len(args))
+			}
+			groups[g] = "(" + strings.Join(ph, ", ") + ")"
+		}
+		return head + strings.Join(groups, ", ") + tail, args
+	}
+	all := make([]int, len(rows))
+	for i := range all {
+		all[i] = i
+	}
+	sql, args := render(all)
+
+	in := &analyze.Insert{Columns: slices.Clone(b.cols)}
+	if s.analysis.Insert != nil {
+		in.ConflictSet = s.analysis.Insert.ConflictSet
+	}
+	for _, r := range rows {
+		cells := make([]analyze.Cell, len(r))
+		for j, v := range r {
+			cells[j] = analyze.Cell{Value: v, Known: true}
+		}
+		in.Rows = append(in.Rows, cells)
+	}
+	s.analysis.Insert = in
+
+	return Statement{sql: sql, args: args, analysis: s.analysis, split: render}, nil
 }

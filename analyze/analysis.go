@@ -121,6 +121,27 @@ type AggregateTerm struct {
 	Star     bool // count(*)
 }
 
+// Cell is one value of an INSERT ... VALUES row.
+type Cell struct {
+	// Value is the literal, or the argument a parameter refers to.
+	Value any
+	// Known is false when the cell is not a literal or a parameter: a function
+	// call, an expression, DEFAULT, a subquery. Such a value cannot be hashed
+	// before the statement runs.
+	Known bool
+}
+
+// Insert describes the rows of an INSERT ... VALUES.
+type Insert struct {
+	// Columns are the column names given in the statement. Empty when the
+	// statement does not name them.
+	Columns []string
+	// Rows are the VALUES rows, in order.
+	Rows [][]Cell
+	// ConflictSet lists the columns an ON CONFLICT DO UPDATE assigns.
+	ConflictSet []string
+}
+
 // Analysis describes one statement.
 type Analysis struct {
 	Op OpKind
@@ -135,6 +156,13 @@ type Analysis struct {
 	// Target is the ID of the table an INSERT, UPDATE or DELETE writes to.
 	// Meaningful only when Op.IsWrite().
 	Target int
+
+	// Insert describes the VALUES rows of an INSERT. It is nil for any other
+	// statement, and for INSERT ... SELECT and INSERT ... DEFAULT VALUES, whose
+	// rows are not known until they run.
+	Insert *Insert
+	// SetColumns lists the columns an UPDATE assigns.
+	SetColumns []string
 
 	Equalities []Equality
 	Bindings   []Binding
@@ -153,6 +181,16 @@ type Analysis struct {
 	Distinct      bool
 	HasWindow     bool
 	HasHaving     bool
+}
+
+// RowSplitter is implemented by analyzers that can restrict an INSERT to some
+// of its VALUES rows. It is needed to send a multi-row INSERT to several shards,
+// each receiving only its own rows.
+type RowSplitter interface {
+	// SplitRows returns the statement with only the given rows (indexes into
+	// Insert.Rows, in the order wanted), and the arguments it now needs. The
+	// parameters are renumbered so that they start at $1 with no gaps.
+	SplitRows(sql string, args []any, rows []int) (string, []any, error)
 }
 
 // Analyzer reads SQL and describes it. Implementations must be safe for

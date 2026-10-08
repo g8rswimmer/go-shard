@@ -35,9 +35,17 @@ func (s Strategy) String() string {
 	}
 }
 
+// ShardStatement is the statement one shard runs when shards run different
+// statements.
+type ShardStatement struct {
+	SQL  string
+	Args []any
+}
+
 // Plan is a routed statement.
 type Plan struct {
-	// SQL and Args are what each target shard runs.
+	// SQL and Args are what each target shard runs, unless PerShard says
+	// otherwise.
 	SQL  string
 	Args []any
 	// Targets are the shards to run on, in a stable order.
@@ -45,4 +53,19 @@ type Plan struct {
 	Strategy Strategy
 	// Reason says why these targets were chosen, for Explain and logs.
 	Reason string
+
+	// Rows is set for an INSERT ... VALUES. It lists, for each target shard,
+	// the indexes of the VALUES rows that belong to it.
+	Rows map[router.ShardID][]int
+	// PerShard is set when shards must run different statements: a multi-row
+	// INSERT whose rows belong to different shards. Shards not listed run SQL.
+	PerShard map[router.ShardID]ShardStatement
+}
+
+// StatementFor returns the SQL and arguments a shard runs.
+func (p Plan) StatementFor(id router.ShardID) (string, []any) {
+	if s, ok := p.PerShard[id]; ok {
+		return s.SQL, s.Args
+	}
+	return p.SQL, p.Args
 }

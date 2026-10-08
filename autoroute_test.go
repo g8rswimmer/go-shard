@@ -51,7 +51,7 @@ func TestBuiltStatementsAreNotParsed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &scoped{db: db}
-	p, err := s.plan(st.SQL(), st.Args(), func() (analyze.Analysis, error) { return st.Analysis(), nil })
+	p, err := s.plan(statementRequest(st))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,18 +72,13 @@ func TestExplicitRoutesSkipAnalysis(t *testing.T) {
 	db := autoDB(t, failingAnalyzer{&calls}, "a", "b")
 	for _, q := range []Querier{db.WithShardKey(1), db.WithShard("a"), db.WithAllShards()} {
 		// This SQL could not be routed automatically (and would fail to analyze).
-		if _, err := q.(*scoped).plan("WITH x AS (SELECT 1) SELECT * FROM x", nil, db.analyzeNow("WITH x AS (SELECT 1) SELECT * FROM x", nil)); err != nil {
+		if _, err := q.(*scoped).plan((&scoped{db: db}).sqlRequest("WITH x AS (SELECT 1) SELECT * FROM x", nil)); err != nil {
 			t.Errorf("explicit route failed: %v", err)
 		}
 	}
 	if calls != 0 {
 		t.Errorf("the analyzer was called %d times although the caller named the shard", calls)
 	}
-}
-
-// analyzeNow is the analysis function Query would use, for tests.
-func (db *DB) analyzeNow(sql string, args []any) analysis {
-	return (&scoped{db: db}).analyzeSQL(sql, args)
 }
 
 func TestCustomAnalyzerDecidesTheRoute(t *testing.T) {
@@ -95,7 +90,7 @@ func TestCustomAnalyzerDecidesTheRoute(t *testing.T) {
 		Bindings: []analyze.Binding{{Column: analyze.ColumnRef{Name: "id"}, Values: []any{7}}},
 	}}
 	db := autoDB(t, an, "a", "b", "c")
-	p, err := (&scoped{db: db}).plan("anything", nil, db.analyzeNow("anything", nil))
+	p, err := (&scoped{db: db}).plan((&scoped{db: db}).sqlRequest("anything", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +103,7 @@ func TestCustomAnalyzerDecidesTheRoute(t *testing.T) {
 func TestAnalyzerErrorsAreReturned(t *testing.T) {
 	calls := 0
 	db := autoDB(t, failingAnalyzer{&calls}, "a")
-	_, err := (&scoped{db: db}).plan("SELECT 1", nil, db.analyzeNow("SELECT 1", nil))
+	_, err := (&scoped{db: db}).plan((&scoped{db: db}).sqlRequest("SELECT 1", nil))
 	if err == nil || !strings.Contains(err.Error(), "must not be called") {
 		t.Errorf("error = %v, want the analyzer's error", err)
 	}
@@ -116,7 +111,7 @@ func TestAnalyzerErrorsAreReturned(t *testing.T) {
 
 func TestWithoutAnAnalyzerRawSQLNeedsARoute(t *testing.T) {
 	db := autoDB(t, nil, "a", "b")
-	_, err := (&scoped{db: db}).plan("SELECT * FROM profiles WHERE id = 1", nil, db.analyzeNow("SELECT * FROM profiles WHERE id = 1", nil))
+	_, err := (&scoped{db: db}).plan((&scoped{db: db}).sqlRequest("SELECT * FROM profiles WHERE id = 1", nil))
 	if !errors.Is(err, ErrShardKeyRequired) {
 		t.Fatalf("error = %v, want ErrShardKeyRequired", err)
 	}

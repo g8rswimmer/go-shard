@@ -77,12 +77,12 @@ registry.Global("countries")
 - Example: a `profile` and its `addresses` always live together.
 
 ### FR-7 Writes
-- Single-row writes route by shard key. The key must be present or derivable, otherwise error.
-- Batch writes are split per shard and run in parallel.
-- Cross-shard writes are best-effort with no atomicity guarantee. The result reports success/failure per shard and per row group.
+- Single-row writes route by shard key. The key must be present as a literal or parameter, otherwise the write is refused before anything is written.
+- Batch writes (an INSERT with many rows) are split per shard and run in parallel; each shard receives only its own rows.
+- Cross-shard writes are best-effort with no atomicity guarantee. The result reports success or failure per shard, and per row group: for an INSERT, which rows each shard received, so the rows of a failed shard can be sent again.
 - Writes to global tables go to all shards, with a per-shard result report.
-- Shard-key columns are immutable. An update that changes a shard key is rejected.
-- Writes accept an optional idempotency key so retries (and future sagas) are safe.
+- Shard-key columns are immutable. An update, or an upsert, that changes a shard key is rejected.
+- Writes accept an optional idempotency key so retries (and future sagas) are safe: a retry applies the write only on shards where it had not been applied, and a key cannot be reused for a different statement. The key is recorded in the same transaction as the write.
 
 ### FR-8 Transactions
 - Full ACID transaction scoped to one shard. All statements must route to the same shard, and this is enforced.

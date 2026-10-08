@@ -58,10 +58,13 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** a table-driven suite of 60+ SQL strings covers every routing rule in architecture 4.3 (including OR, ranges, function calls on the key, subqueries) and each yields the documented result.
 
 ### M4 Writes (M) - FR-7
-- Insert routing from builder rows and raw `VALUES`; batch split per shard, parallel execution.
-- Update / delete routing; reject updates to shard-key columns (`ErrShardKeyImmutable`).
-- Global-table writes to all shards.
-- `WriteResult` with per-shard outcome; optional idempotency key and its table.
+- INSERT routing from `VALUES`, for raw SQL and for the builder (`query.InsertInto`, with `OnConflictDoNothing`, `OnConflictUpdate`, `Returning`): each row goes to the shard that owns its key.
+- Batch split: a multi-row INSERT is rewritten per shard (`analyze.RowSplitter`, implemented with PostgreSQL's deparser) and run in parallel; each shard receives only its own rows.
+- Update / delete routing (done in M3); reject updates to shard-key columns, including via `ON CONFLICT DO UPDATE` (`ErrShardKeyImmutable`).
+- Global-table writes to all shards (done in M3).
+- `WriteResult` with per-shard outcome, the rows each shard received, and `Failed()` / `FailedRows()`.
+- Idempotency: `WithIdempotencyKey(ctx, key)`; key recorded per shard in the same transaction as the write; `EnsureIdempotencyTable`, `IdempotencyDDL`, `PruneIdempotencyKeys`; `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing`.
+- `shardtest.Cluster.Stop` to test a real shard outage.
 - `examples/writes`.
 - **Done when:** integration tests cover a batch where one shard is down (others commit, result lists the failure), and a retry with the same idempotency key applies only where it had not committed.
 
