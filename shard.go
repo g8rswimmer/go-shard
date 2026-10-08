@@ -4,21 +4,30 @@
 // the same migrations to every shard. See docs/REQUIREMENTS.md and
 // docs/ARCHITECTURE.md.
 //
-// Open a DB, then tell it where each statement belongs:
+// Open a DB and run SQL. The library reads the shard key from the statement
+// and runs it on the shard that owns it:
 //
 //	db, err := shard.Open(ctx, cfg)
 //	...
-//	_, err = db.WithShardKey(id).Exec(ctx, "INSERT INTO profiles (id, name) VALUES ($1, $2)", id, name)
-//	rows, err := db.WithShardKey(id).Query(ctx, "SELECT name FROM profiles WHERE id = $1", id)
+//	rows, err := db.Query(ctx, "SELECT name FROM profiles WHERE id = $1", id)
 //
-// Routing from the SQL itself is added in a later milestone; until then a
-// statement without WithShardKey, WithShard or WithAllShards fails with
-// ErrShardKeyRequired.
+// A statement it cannot place is refused, not guessed: no condition on the
+// shard key gives ErrShardKeyRequired, and tables not tied together by their
+// shard key give ErrCrossShardJoin. You can always say where a statement goes:
+//
+//	db.WithShardKey(id).Exec(ctx, "INSERT INTO profiles (id, name) VALUES ($1, $2)", id, name)
+//	db.WithShard("shard-02").Query(ctx, "SELECT ...")
+//	db.WithAllShards().Exec(ctx, "CREATE TABLE ...")
+//
+// Statements built with package query carry their routing and need no SQL
+// parsing.
 package shard
 
 import (
 	"context"
+	"sync/atomic"
 
+	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
@@ -30,6 +39,8 @@ type DB struct {
 	router   *router.HashRouter
 	pool     *exec.Pool
 	exec     *exec.Executor
+	analyzer analyze.Analyzer // nil when raw SQL cannot be analyzed (no cgo)
+	next     atomic.Uint64    // spreads statements any shard can answer
 }
 
 var _ Querier = (*DB)(nil)
@@ -55,12 +66,24 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
+	analyzer := cfg.Analyzer
+	if analyzer == nil {
+		analyzer = defaultAnalyzer()
+	}
 	return &DB{
 		registry: cfg.Registry,
 		router:   r,
 		pool:     pool,
 		exec:     exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout}),
+		analyzer: analyzer,
 	}, nil
+}
+
+// anyShard picks the shard for a statement every shard can answer, such as a
+// read of a global table, taking turns so no shard carries them all.
+func (db *DB) anyShard() ShardID {
+	ids := db.pool.IDs()
+	return ids[(db.next.Add(1)-1)%uint64(len(ids))]
 }
 
 // Close closes every shard's connection pool.

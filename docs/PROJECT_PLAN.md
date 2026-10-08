@@ -32,7 +32,7 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** CI is green on an empty-but-compiling module and `make up` starts 3 shards.
 
 ### M1 Registry and router (M) - FR-2, FR-3
-- `registry`: `Sharded`, `Colocated`, `Global`, `Validate()` (missing parent, cycles, key type mismatch).
+- `registry`: `Sharded`, `Colocated`, `Global`, `Validate()` (missing parent, cycles, key type mismatch). From M3, a sharded table must also declare its key type.
 - `router`: key canonicalization (int, uuid, string), xxhash64, 1024 buckets, bucket-map validation, `ShardFor` / `ShardsFor` / `All`, and an `Even` helper that splits buckets across shards.
 - Fixed hash test vectors so the hash can never change silently.
 - **Done when:** unit tests cover all validation errors; vectors pass; bucket map with a gap or overlap is rejected.
@@ -47,12 +47,14 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** an integration test inserts and reads a row by key across a 3-shard cluster, and the row is physically on the shard the router chose.
 
 ### M3 Analyzer (L) - FR-4
-- `Analysis` type; builder path producing it directly (small fluent builder: select, where, order, limit).
-- `analyze/pgparse` with `pg_query_go`: tables, equality and `IN` predicates on shard key, top-level `AND`, positional args, joins, order, limit, aggregates.
-- Colocated join checks; global-table-only queries; `ErrUnsupportedQuery` naming the construct.
-- Overrides `WithShardKey`, `WithShard`, `WithAllShards`.
-- Strict-mode errors (`ErrShardKeyRequired`, `ErrCrossShardJoin`).
-- Cross-compilation and static-build notes for the cgo dependency.
+- `analyze`: the `Analysis` type (facts about a statement) and the `Analyzer` interface.
+- `analyze/pgparse` with `pg_query_go`: tables, equality / `IN` / `ANY` conditions on the shard key, top-level `AND`, positional args, joins and `USING`, subqueries (each at its own query level), order, limit, aggregates.
+- `plan.Route`: applies the routing rules (ARCHITECTURE 4.3), including colocation checks, global-table-only statements, key type coercion (the registry now requires a key type on every sharded table, so coercion always applies), and `ErrUnsupportedQuery` naming the construct.
+- `query` builder (select, update, delete; where, order, limit) producing an `Analysis` directly; `QueryStatement` / `ExecStatement`.
+- Overrides `WithShardKey`, `WithShard`, `WithAllShards` bypass analysis.
+- Strict-mode errors (`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`).
+- `docs/BUILDING.md`: cgo, cross-compilation and static builds (tested in Linux containers); CI job that builds and tests with `CGO_ENABLED=0`.
+- `INSERT` routing is left to M4.
 - **Done when:** a table-driven suite of 60+ SQL strings covers every routing rule in architecture 4.3 (including OR, ranges, function calls on the key, subqueries) and each yields the documented result.
 
 ### M4 Writes (M) - FR-7

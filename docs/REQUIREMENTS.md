@@ -38,14 +38,15 @@ See section 8 for what adding these later would involve.
 
 ### FR-2 Schema registry (metadata)
 - Each table is declared once as one of:
-  - *sharded*: has a shard key.
-  - *colocated*: has a parent table and the same shard key.
+  - *sharded*: has a shard key and the key's type (int, uuid or string).
+  - *colocated*: has a parent table and the same shard key; it inherits the key type.
   - *global*: replicated to every shard.
-- The registry validates itself at startup (colocated parent exists, key columns present, no cycles).
+- The key type is required because routing hashes a key by its type: without it the number 42 and the text "42" would reach different shards, and a service passing IDs as strings (an HTTP path parameter, say) would silently read and write the wrong shard. With it, keys found in SQL or arguments are converted to the declared type before hashing.
+- The registry validates itself at startup (colocated parent exists, key columns and key type present, no cycles).
 
 ```go
-registry.Sharded("profiles",  shard.Key("profile_id"))
-registry.Colocated("addresses", shard.With("profiles"), shard.Key("profile_id"))
+registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt))
+registry.Colocated("addresses", registry.With("profiles"), registry.Key("profile_id"))
 registry.Global("countries")
 ```
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -44,6 +45,11 @@ type Config struct {
 	// ShardTimeout limits each shard's work, including streaming its rows.
 	// Zero means no limit beyond the caller's context.
 	ShardTimeout time.Duration
+	// Analyzer reads raw SQL to find where it belongs. The default uses
+	// PostgreSQL's own parser, which needs cgo; without cgo the default is
+	// none, and only WithShardKey / WithShard / WithAllShards and built
+	// statements (package query) can route. See docs/BUILDING.md.
+	Analyzer analyze.Analyzer
 }
 
 // validate checks the config and builds the router. The error wraps

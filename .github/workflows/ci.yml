@@ -32,6 +32,21 @@ jobs:
       - run: go build ./...
       - run: go test -race ./...
 
+  nocgo:
+    # The library must still build and pass its tests without cgo; only raw SQL
+    # routing is unavailable (see docs/BUILDING.md).
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
   integration:
     runs-on: ubuntu-latest
     strategy:

@@ -42,8 +42,9 @@ go-shard/
   config.go           Config structs and validation (FR-1)
   registry/           Table metadata: sharded, colocated, global (FR-2)
   router/             Key canonicalization, hashing, bucket map (FR-3)
-  analyze/            Builder + raw SQL -> Analysis (FR-4)
-    pgparse/          pg_query_go adapter (only package that imports cgo)
+  analyze/            Engine-neutral Analysis of a statement; Analyzer interface (FR-4)
+    pgparse/          pg_query_go adapter (only package that needs cgo)
+  query/              Builder: SELECT / UPDATE / DELETE statements that carry their Analysis (FR-4)
   plan/               Plan type, strategies, Explain rendering (FR-9)
   exec/               Shard pool, parallel executor, tx pinning (FR-1, FR-8)
   merge/              Ordered merge, limit/offset, distinct, aggregates (FR-5)
@@ -59,8 +60,9 @@ go-shard/
 Dependency direction (arrows mean "imports"). Nothing imports the facade, and only `analyze/pgparse` imports cgo:
 
 ```
-shard -> plan, exec, merge, write, migrate, observe
+shard -> plan, exec, merge, write, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
 plan, write -> router, registry, analyze
+query -> analyze
 exec, merge, migrate -> (types from plan/registry only)
 analyze -> registry
 analyze/pgparse -> cgo (pg_query_go)
@@ -77,7 +79,7 @@ type Table struct {
     Name    string
     Kind    Kind
     KeyCol  string  // empty for Global
-    KeyType KeyType // optional; inherited from the root table
+    KeyType KeyType // required on sharded tables; colocated tables inherit it
     Parent  string  // for Colocated
     Group   string  // colocation group: the root sharded table's name
 }
@@ -101,22 +103,28 @@ type Router interface {
     All() []ShardID
 }
 
-// analyze: engine-neutral description of a statement
+// analyze: engine-neutral FACTS about a statement. Routing decides what they mean.
 type Analysis struct {
-    Op         OpKind // Select, Insert, Update, Delete
-    Tables     []TableRef
-    KeyValues  map[string][]any // table -> shard-key values found (nil = none)
-    Joins      []JoinInfo       // equality joins, used for colocation checks
-    OrderBy    []OrderTerm
-    Limit, Offset *int64
-    Aggregates []AggregateTerm
-    GroupBy    []string
-    Distinct   bool
+    Op         OpKind // OpSelect, OpInsert, OpUpdate, OpDelete, OpOther (DDL...)
+    Kind       string // names the statement when Op is OpOther
+    Scopes     []int  // Scopes[i] = parent query level of level i; level 0 is the statement
+    Tables     []TableRef   // every table use: ID, Scope, Schema, Name, Alias
+    Target     int          // table written by INSERT / UPDATE / DELETE
+    Equalities []Equality   // a.col = b.col (WHERE, and ON), AND-ed
+    Bindings   []Binding    // col = 5, col IN (1,2), col = ANY($1): parameters already resolved
+    Usings     []Using      // JOIN ... USING (cols)
+    Notes      []string     // conditions that could not be used (OR, ranges...), shown when routing fails
+    // For merging results (M6); routing ignores them:
+    OrderBy []OrderTerm; Limit, Offset *int64; GroupBy []string
+    Aggregates []AggregateTerm; Distinct, HasWindow, HasHaving bool
 }
 type Analyzer interface {
     FromSQL(sql string, args []any) (Analysis, error)
 }
-// builder queries produce Analysis directly, without parsing.
+// A built query.Statement produces its Analysis directly, without parsing.
+
+// plan: the Route stage. Pure: no database, no parser.
+func Route(a analyze.Analysis, reg *registry.Registry, r router.Router, opts Options) (Plan, error)
 
 // plan
 type Strategy int // Single, Multi, All
@@ -145,16 +153,16 @@ type Merger interface {
 ### 4.1 Read by shard key (single shard)
 
 ```
-db.Query(ctx, sql, args...)
-  -> Analyzer.FromSQL            tables=[profiles], key profile_id=$1
-  -> Router.ShardFor(args[0])    shard-03
+db.Query(ctx, "SELECT ... FROM profiles WHERE id = $1", 42)
+  -> Analyzer.FromSQL            tables=[profiles], binding id = 42
+  -> plan.Route                  coerce 42 to the key type, Router -> shard-03
   -> Plan{Strategy: Single, Targets: [shard-03]}
-  -> Executor.Run                one query, rows returned as-is
+  -> Executor.Query              one query, rows returned as-is
 ```
 
 ### 4.2 Fan-out read (all shards)
 
-Only allowed when the caller opts in with `WithAllShards()`; otherwise the router returns `ErrShardKeyRequired` (FR-3, FR-4).
+Only allowed when the caller opts in with `WithAllShards()`; otherwise the router returns `ErrShardKeyRequired` (FR-3, FR-4). Reading from more than one shard is added with the merge layer (M6); until then it returns `ErrUnsupportedQuery`.
 
 ```
 SELECT ... ORDER BY created_at DESC LIMIT 20   (WithAllShards)
@@ -166,23 +174,48 @@ SELECT ... ORDER BY created_at DESC LIMIT 20   (WithAllShards)
 
 ### 4.3 Routing rules (analysis of predicates)
 
-| Predicate on shard key | Result |
-|---|---|
-| `key = $1` | Single shard |
-| `key IN ($1, $2, ...)` | The distinct shards those keys hash to (Multi) |
-| Top-level `AND` containing either of the above | Same as above |
-| `OR`, function calls on the key, ranges, subqueries | Not determinable: error unless `WithAllShards()` / `WithShardKey()` |
-| No predicate | Error unless `WithAllShards()` |
-| Only global tables referenced | Any single shard (round-robin), since all shards hold the data |
+`plan.Route` applies these rules to an `Analysis`. Anything it cannot prove safe is refused, never guessed.
 
-Joins are allowed only if every non-global table is in the same colocation group and joined to its parent on the shard key. Otherwise: `ErrCrossShardJoin` with the alternatives named (FR-5, FR-6).
+**Which conditions pick shards.** Only conditions that restrict the result and are AND-ed at the top level count: in `WHERE`, and in the `ON` of an inner join. In the `ON` of an outer join only the key *links* count, never constants (a constant there does not filter the preserved side).
+
+| Condition on the shard key | Result |
+|---|---|
+| `key = $1`, `key = 42`, `42 = key`, `key = $1::bigint` | The one shard that key hashes to |
+| `key IN (a, b, ...)`, `key = ANY($1)` (slice argument), `key = ANY(ARRAY[...])` | The distinct shards those keys hash to (Multi, or All if every shard) |
+| Several of the above on the same key, AND-ed | The intersection. Conflicting conditions (`key = 1 AND key = 2`) match nothing: any one shard answers |
+| `OR`, `NOT`, `<>`, `NOT IN`, ranges, `BETWEEN`, `LIKE`, `IS NULL`, `= NULL`, a function on the key, a comparison with another expression, `IN (subquery)` | Not usable: noted in the error. Error unless `WithAllShards()` / `WithShardKey()` |
+| No usable condition | `ErrShardKeyRequired`, naming the table and key column |
+
+**Key types.** The registry requires a key type on every sharded table (colocated tables inherit it), so every key found in SQL or arguments is converted to it before hashing: `'42'` and `42` reach the same shard for an int key, and a value that cannot be converted is an error. The requirement exists because keys are hashed by Go type; without it a string ID from an HTTP path would silently go to a different shard than the same number.
+
+**Tables.**
+
+| Statement touches | Result |
+|---|---|
+| Only global tables, or no table (`SELECT 1`), or system schemas | Any one shard, taking turns |
+| `INSERT` / `UPDATE` / `DELETE` on a global table (and no sharded table) | Every shard |
+| A write to a global table that also uses a sharded table | `ErrUnsupportedQuery` (split it) |
+| A table not in the registry | `ErrUnknownTable` |
+| Sharded or colocated tables from more than one colocation group | `ErrCrossShardJoin`, naming the alternatives |
+| `INSERT` into a sharded table | `ErrShardKeyRequired` for now; routing from `VALUES` arrives with writes (M4) |
+| DDL and other non-DML statements | `ErrUnsupportedQuery`: use `WithAllShards()` or the migrations runner |
+
+**Joins and subqueries.** Every use of a sharded/colocated table (in the FROM clause or in any subquery) is a node. Nodes are tied together by shard-key equality: `ON a.key = b.key`, `USING (key)`, or a correlated subquery condition. Each resulting group is limited to the shards its key conditions allow.
+
+- One group: routed by its conditions, or `ErrShardKeyRequired` if it has none.
+- Several groups: allowed only if every group is pinned to the same single shard (`p.id = $1 AND a.profile_id = $1`). Otherwise `ErrCrossShardJoin`: matching rows could be on different shards.
+- Global tables never matter for routing.
+
+**Naming.** A qualified column (`p.id`, `profiles.id`, `public.profiles.id`) is matched to a table by alias or name, searching the enclosing queries outward. An unqualified column is matched to the table in the nearest query level whose shard key has that name. If that level has tables but none is keyed by the name, the column may belong to one of them (we cannot see their other columns), so the search stops: in `WHERE EXISTS (SELECT 1 FROM countries WHERE id = 5)` the `id` is `countries.id` and must not route the outer `profiles`. After `USING (id)`, an unqualified `id` names the merged column.
+
+**Not supported for routing** (`ErrUnsupportedQuery`, naming the construct): `WITH`, `UNION`/`INTERSECT`/`EXCEPT`, a subquery or function in `FROM`, `NATURAL JOIN`, `VALUES`, `SELECT INTO`, several statements in one call. They still run when the caller names the shard (`WithShardKey`, `WithShard`).
 
 ## 5. Components
 
 ### 5.1 Registry (FR-2)
 
 - Built in code at startup: `registry.New(registry.Sharded(...), registry.Colocated(...), registry.Global(...))`.
-- `New` validates and returns every problem at once: missing key, missing or global parent, cycles, global tables with options, duplicate names, and a colocated table whose declared key type differs from its root's. Group is the root ancestor's name.
+- `New` validates and returns every problem at once: missing key, a sharded table with no key type, an invalid key type, missing or global parent, cycles, global tables with options, duplicate names, and a colocated table whose declared key type differs from its root's. Group is the root ancestor's name.
 - A colocated table's key column may have a different name from its parent's (for example `profiles.id` and `addresses.profile_id`).
 - Immutable once built, so it is safe for concurrent use without locks. There is no separate `Validate()` call.
 - Names are matched exactly as declared; declare them in lower case, as PostgreSQL folds unquoted identifiers.
@@ -197,13 +230,19 @@ Joins are allowed only if every non-global table is in the same colocation group
 - The bucket count is fixed so that adding resharding later moves buckets, not every key.
 - `Router` is an interface; the default implementation is the only one in v1.
 
-### 5.3 Analyzer (FR-4)
+### 5.3 Analyzer and query builder (FR-4)
 
-- **Builder path:** the builder already has table, predicates, order and limit, so it fills `Analysis` directly. This is the primary path.
-- **Raw SQL path:** `pgparse` parses with `pg_query_go`, walks the tree and fills `Analysis`. Positional args (`$n`) are resolved against the supplied args.
-- Anything outside the supported subset (see 5.5) yields an `ErrUnsupportedQuery` that names the construct.
-- Only `analyze/pgparse` imports cgo. Building with a different parser means implementing `Analyzer`.
-- Overrides `WithShardKey`, `WithShard`, `WithAllShards` bypass predicate analysis and are recorded in `Plan.Reason`.
+Two producers of `Analysis`, one consumer (`plan.Route`):
+
+- **Builder (`query`)**: `query.From("profiles").Where(query.Eq("id", 42)).Build()` returns a `Statement` with its SQL, arguments and `Analysis`, so no parsing happens and no cgo is needed. Supports `SELECT` (columns, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE` and `DELETE`, with `Eq`, `In`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `Like`, `IsNull`, `NotNull`, AND-ed. Every identifier is validated and quoted, so a column name cannot change the statement. Anything else is written as SQL. Run with `db.QueryStatement` / `db.ExecStatement`. A test proves the builder's `Analysis` routes exactly like the parser's reading of the SQL the builder wrote.
+- **Raw SQL (`analyze/pgparse`)**: parses with `pg_query_go` (PostgreSQL's own parser, v6 / PG 17 grammar) and walks the tree:
+  - `$n` is replaced by the argument; integers too large for 32 bits (which the parser stores as text) are read back as integers.
+  - Each subquery gets its own query level (found by walking the whole expression tree, so a subquery inside a `CASE`, a function argument or a select list is not missed).
+  - Constants in the `ON` of an outer join are recorded as notes, not bindings.
+  - Statements it cannot route safely return `ErrUnsupportedQuery` naming the construct.
+- Parsing is per call and not cached. A cache keyed by SQL text is a straightforward later optimisation.
+- Only `analyze/pgparse` needs cgo. Without cgo the package is empty, `Config.Analyzer` defaults to none, and raw SQL needs an explicit route (see docs/BUILDING.md). `Config.Analyzer` accepts any `analyze.Analyzer`.
+- `WithShardKey`, `WithShard` and `WithAllShards` bypass analysis completely and are recorded in `Plan.Reason`. They are the escape hatch, so the caller is trusted.
 
 ### 5.4 Executor and shard pool (FR-1, FR-5)
 
@@ -417,7 +456,7 @@ db, err := shard.Open(ctx, cfg)
 
 Sentinel errors, wrapped with context, usable with `errors.Is`:
 
-`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrCrossShardTx`, `ErrUnsupportedQuery`, `ErrShardKeyImmutable`, `ErrMergeLimitExceeded`, and `*ShardError` carrying a `ShardID` and cause. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
+`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig` (all in place), and later `ErrCrossShardTx`, `ErrShardKeyImmutable`, `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
 
 ## 8. Testing strategy
 
@@ -434,7 +473,7 @@ Sentinel errors, wrapped with context, usable with `errors.Is`:
 | Dependency | Why |
 |---|---|
 | `github.com/jackc/pgx/v5/stdlib` | Postgres driver for `database/sql` |
-| `github.com/pganalyze/pg_query_go/v5` | SQL parsing (cgo) |
+| `github.com/pganalyze/pg_query_go/v6` | SQL parsing (cgo, `analyze/pgparse` only) |
 | `github.com/cespare/xxhash/v2` | Stable fast hash |
 | `github.com/golang-migrate/migrate/v4` | Per-shard migrations |
 | `golang.org/x/sync` | `errgroup` and semaphore |
@@ -467,10 +506,12 @@ Resolved from REQUIREMENTS section 7:
 - Bucket count and storage: 1024 virtual buckets, static config.
 - Parser: `pg_query_go`, isolated behind `Analyzer`.
 - Minimum versions: Go 1.26, PostgreSQL 14+.
+- Builder: a small fluent builder in its own package `query` (SELECT / UPDATE / DELETE); INSERT arrives with M4.
+- Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
 - Migrations: wrap `golang-migrate` behind `Migrator`.
 
 Still open (decide in the project plan or early implementation):
 
 - Whether `observe/otel` is a separate Go module to keep the core dependency-free.
-- Builder API surface: a fluent builder vs generated typed repositories. v1 proposal is a small fluent builder; typed repositories can be layered on top.
+- Typed repositories on top of the builder (the fluent builder itself is done in M3).
 - Where the idempotency-key table is created (by the library's own migration vs the user's migrations).

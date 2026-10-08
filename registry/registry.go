@@ -5,10 +5,13 @@
 // it is safe for concurrent use without locks.
 //
 //	reg, err := registry.New(
-//	    registry.Sharded("profiles", registry.Key("id")),
+//	    registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt)),
 //	    registry.Colocated("addresses", registry.With("profiles"), registry.Key("profile_id")),
 //	    registry.Global("countries"),
 //	)
+//
+// Every sharded table must declare the type of its shard key; colocated tables
+// inherit it from the table they are colocated with.
 //
 // Table and column names are matched exactly as declared. PostgreSQL folds
 // unquoted identifiers to lower case, so declare them in lower case.
@@ -51,8 +54,14 @@ func (k Kind) String() string {
 	}
 }
 
-// KeyType is the declared type of a shard key column. It is optional; a
-// colocated table must not declare a type that differs from its root table's.
+// KeyType is the declared type of a shard key column.
+//
+// It is required on every sharded table, and colocated tables inherit it (one
+// that declares its own must match). Routing hashes a key by its Go type, so
+// without a declared type the number 42 and the text "42" would go to
+// different shards, even though PostgreSQL treats them as the same bigint. With
+// a declared type, keys found in SQL or in arguments are converted to it
+// before hashing.
 type KeyType int
 
 const (
@@ -84,8 +93,9 @@ type Table struct {
 	Kind Kind
 	// KeyCol is the shard key column. Empty for global tables.
 	KeyCol string
-	// KeyType is the declared key type, inherited from the root table when a
-	// colocated table does not declare its own. May be KeyTypeUnset.
+	// KeyType is the key type: declared on a sharded table, inherited from the
+	// root table by a colocated table that does not declare its own. Never
+	// KeyTypeUnset for sharded and colocated tables; unset for global tables.
 	KeyType KeyType
 	// Parent is the table this one is colocated with. Empty unless colocated.
 	Parent string
@@ -110,13 +120,14 @@ type Option func(*Decl)
 // Key sets the shard key column of a sharded or colocated table.
 func Key(column string) Option { return func(d *Decl) { d.key = column } }
 
-// Type declares the type of the shard key column.
+// Type declares the type of the shard key column. Required on sharded tables;
+// see KeyType.
 func Type(t KeyType) Option { return func(d *Decl) { d.keyType = t } }
 
 // With names the parent table a colocated table is placed with.
 func With(parent string) Option { return func(d *Decl) { d.parent = parent } }
 
-// Sharded declares a table partitioned across shards. Requires Key.
+// Sharded declares a table partitioned across shards. Requires Key and Type.
 func Sharded(name string, opts ...Option) Decl { return newDecl(name, KindSharded, opts) }
 
 // Colocated declares a table stored on the same shard as its parent. Requires
@@ -203,10 +214,17 @@ func New(decls ...Decl) (*Registry, error) {
 
 // validateShape checks the options given to a single declaration.
 func validateShape(d Decl, add func(string, ...any)) {
+	if d.keyType < KeyTypeUnset || d.keyType > KeyString {
+		add("table %q: invalid key type %d", d.name, int(d.keyType))
+	}
 	switch d.kind {
 	case KindSharded:
 		if d.key == "" {
 			add("sharded table %q needs a shard key: use registry.Key", d.name)
+		}
+		if d.keyType == KeyTypeUnset {
+			add("sharded table %q needs a key type: use registry.Type(registry.KeyInt), KeyUUID or KeyString, "+
+				"so that a key such as 42 and \"42\" reach the same shard", d.name)
 		}
 		if d.parent != "" {
 			add("sharded table %q cannot have a parent; use Colocated for %q", d.name, d.parent)

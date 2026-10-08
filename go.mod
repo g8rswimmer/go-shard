@@ -5,9 +5,11 @@ go 1.26.0
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/pganalyze/pg_query_go/v6 v6.2.5
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 	golang.org/x/sync v0.23.0
+	google.golang.org/protobuf v1.34.2
 )
 
 require (
