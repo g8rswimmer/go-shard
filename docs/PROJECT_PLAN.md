@@ -41,7 +41,7 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - `Config`, `shard.Open` (validate registry + bucket map, ping all shards), `Close`, `Health`.
 - `exec`: one `*sql.DB` per shard, parallel `Query` (fail-fast) and `Exec` (best-effort) with per-shard timeout and a `MaxFanout` bound.
 - Routing in M2 is explicit (`WithShardKey`, `WithShard`, `WithAllShards`); the analyzer in M3 makes it automatic.
-- `Querier` interface (`Query`, `Exec`); `*shard.DB` implements it. `Begin` and `Explain` are added in M5 and M7.
+- `Querier` interface (`Query`, `Exec`, and the statement forms); `*shard.DB` and `Tx` implement it. `Begin` is on `TxBeginner` (M5); `Explain` is added in M7.
 - `shardtest.NewCluster` (testcontainers, plus `SHARDTEST_DSNS` mode), `Seed`, and helpers to assert where a row physically is.
 - `examples/quickstart` (explicit `WithShardKey` routing until M3).
 - **Done when:** an integration test inserts and reads a row by key across a 3-shard cluster, and the row is physically on the shard the router chose.
@@ -69,8 +69,10 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** integration tests cover a batch where one shard is down (others commit, result lists the failure), and a retry with the same idempotency key applies only where it had not committed.
 
 ### M5 Transactions (S) - FR-8
-- `Begin` with `ForKey` / `ForShard`, shard pinning, `ErrCrossShardTx`, global-table writes rejected inside a transaction.
-- `examples/colocation` (profile + addresses in one transaction, colocated join).
+- `Begin` with `ForKey` / `ForTable` / `ForShard`, `InTx`, `ReadOnly` / `Isolation`; shard pinning; `Tx` is a `Querier` (so `Begin` lives on a separate `TxBeginner`, not on `Querier`).
+- Every statement is routed and then checked against the transaction's shard (`ErrCrossShardTx`); global reads stay on that shard; global-table writes are refused; `tx.Unchecked()` for SQL the router cannot place.
+- Idempotency keys refused inside a transaction.
+- `examples/colocation` (profile + addresses in one transaction, colocated join, rollback, cross-shard refusal).
 - **Done when:** a rollback test shows profile and addresses roll back together, and a statement targeting another shard fails without side effects.
 
 ### M6 Fan-out and merge (L) - FR-5, FR-6

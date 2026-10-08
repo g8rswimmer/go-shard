@@ -162,7 +162,7 @@ func (rt *routing) routeInsert() (Plan, error) {
 		default:
 			// a value we can hash
 		}
-		key, err := coerceKey(row[keyAt].Value, t.KeyType)
+		key, err := CoerceKey(row[keyAt].Value, t.KeyType)
 		if err != nil {
 			return Plan{}, fmt.Errorf("shard key %s.%s in row %d: %w", t.Name, t.KeyCol, i, err)
 		}
@@ -261,9 +261,10 @@ func (rt *routing) globalOnly(opts Options) (Plan, error) {
 		default:
 			all := rt.r.All()
 			return Plan{
-				Targets:  all,
-				Strategy: All,
-				Reason:   fmt.Sprintf("%s global table %q: every shard holds a copy", rt.a.Op, t.tbl.Name),
+				Targets:     all,
+				Strategy:    All,
+				GlobalWrite: true,
+				Reason:      fmt.Sprintf("%s global table %q: every shard holds a copy", rt.a.Op, t.tbl.Name),
 			}, nil
 		}
 	}
@@ -326,7 +327,7 @@ func (rt *routing) link() error {
 		t := rt.insts[id].tbl
 		vals := make([]any, len(b.Values))
 		for i, v := range b.Values {
-			c, err := coerceKey(v, t.KeyType)
+			c, err := CoerceKey(v, t.KeyType)
 			if err != nil {
 				return fmt.Errorf("shard key %s.%s: %w", t.Name, t.KeyCol, err)
 			}
@@ -565,10 +566,10 @@ func intersect(a, b []router.ShardID) []router.ShardID {
 	return out
 }
 
-// coerceKey converts a value found in SQL or arguments to the type of the key
+// CoerceKey converts a value found in SQL or arguments to the type of the key
 // column, so that the same key always hashes the same way. A bigint key
 // compared with the text '42' must route like the number 42.
-func coerceKey(v any, kt registry.KeyType) (any, error) {
+func CoerceKey(v any, kt registry.KeyType) (any, error) {
 	if v == nil {
 		return nil, router.ErrNilKey
 	}

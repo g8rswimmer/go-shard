@@ -26,6 +26,11 @@ var (
 	// ErrUnknownTable is returned for a table that is not in the registry.
 	ErrUnknownTable = plan.ErrUnknownTable
 
+	// ErrCrossShardTx is returned when a statement inside a transaction belongs
+	// to a different shard from the transaction's, or to several. Nothing is
+	// sent to any shard, and the transaction remains usable.
+	ErrCrossShardTx = errors.New("shard: statement is outside the transaction's shard")
+
 	// ErrUnknownShard is returned when WithShard names a shard that is not
 	// configured.
 	ErrUnknownShard = exec.ErrUnknownShard

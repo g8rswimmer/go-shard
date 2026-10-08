@@ -263,6 +263,7 @@ Two producers of `Analysis`, one consumer (`plan.Route`):
 - **Writes do not fail fast.** Every target is attempted and each outcome is reported, because a write that succeeded on some shards must be visible. The facade turns the outcomes into a `WriteResult` plus an error if any shard failed.
 - A plan may give each shard its own statement (`Plan.PerShard`, read through `Plan.StatementFor`): this is how a multi-row INSERT sends every shard only its rows. `ShardExec` also reports the VALUES rows the shard received and whether the write was a replay.
 - `Executor.ExecIdempotent` runs the same fan-out with the idempotency protocol of 5.6.
+- `Executor.Begin` returns an `exec.Tx`: one shard, one `*sql.Tx`, one connection, with `Query` / `Exec` / `Commit` / `Rollback` (5.7).
 - `AllowPartial()` for reads (rows plus a `[]ShardError`) arrives with the merge layer in M6.
 - Reads can be retried once on connection errors; this is not implemented yet. Writes are never retried by the library: a retry is the caller's, made safe by an idempotency key (5.6).
 - Rows are streamed per shard so the merger can start before all shards finish.
@@ -314,13 +315,26 @@ The table (default `go_shard_idempotency_keys`, set with `Config.IdempotencyTabl
 ### 5.7 Transactions (FR-8)
 
 ```go
-tx, err := db.Begin(ctx, shard.ForKey(profileID)) // or ForShard(id)
+err := db.InTx(ctx, shard.ForTable("profiles", id), func(tx shard.Tx) error {
+    _, err := tx.Exec(ctx, "INSERT INTO profiles ...")
+    ...
+})
+// or, by hand:
+tx, err := db.Begin(ctx, shard.ForTable("profiles", id))
+defer tx.Rollback() // harmless after Commit (returns ErrTxDone)
 ```
 
-- A transaction is pinned to one shard, chosen at `Begin` from a key or shard ID.
-- Every statement inside runs through the normal Analyze/Route path, then a check: the target must equal the pinned shard, otherwise `ErrCrossShardTx`.
-- Colocated tables make this practical: profile and addresses writes share one transaction and one SQL transaction block.
-- Global-table writes are not allowed inside a transaction (they would touch every shard).
+- **One shard per transaction**, chosen at `Begin` from a target: `ForShard(id)`; `ForKey(key)` (hashed as given); or `ForTable(table, key)`, which converts the key to the table's declared type first, so `42` and `"42"` pick the same shard. `ForKey` exists for keys you already hold in the right type; prefer `ForTable`.
+- **Every statement is routed as usual, then checked**: its plan must target exactly the transaction's shard, otherwise `ErrCrossShardTx`, returned before anything is sent so the transaction stays usable. The message names both shards and says how to proceed.
+- **Global tables.** A statement that only reads global tables runs on the transaction's shard (`plan.Options.AnyShard` returns it). A write to a global table targets every shard, so it is refused, with a hint (`Plan.GlobalWrite`). With a single shard, "every shard" is the transaction's shard and the write is allowed.
+- **`Tx` is a `Querier`**, so repository code written against `Querier` (`Query`, `Exec`, `QueryStatement`, `ExecStatement`) runs unchanged inside a transaction, with the same routing, builder statements and `RETURNING` support. `Begin` is deliberately **not** on `Querier`: it lives on a separate `TxBeginner` (implemented by `*DB`), so a `Tx` cannot start another and fakes of `Querier` stay small. This differs from the earlier sketch, which put `Begin` on `Querier`.
+- **Colocated tables make this practical**: a profile and its addresses are on one shard, so one transaction writes both, and an ordinary join reads them back.
+- **`InTx`** commits when the function returns nil and rolls back on an error or a panic (which continues), so a transaction cannot be left open.
+- **`tx.Unchecked()`** returns a `Querier` that runs on the transaction's shard with no routing or checks, for SQL the router cannot place (`WITH`, a scan by a non-key column). The caller vouches that the statement belongs on this shard. Refusals that it can resolve say so.
+- **Options:** `ReadOnly()` and `Isolation(level)` map onto `sql.TxOptions`.
+- **Lifetime and timeouts.** `exec.Tx` holds one `*sql.Tx`, so all statements share a connection. The context given to `Begin` ends the transaction when cancelled (`database/sql` rolls it back). `ShardTimeout` applies to each statement, not to the transaction as a whole. A transaction has one connection, so the `Rows` of a query must be closed before the next statement.
+- **Idempotency keys are refused inside a transaction** (`ErrUnsupportedQuery`): the transaction is already atomic on its shard, and one key per statement would collide with the key-reuse check. Put the key on a statement outside the transaction.
+- **Not supported:** nested transactions and savepoints; a transaction that spans shards (see REQUIREMENTS section 8).
 
 ### 5.8 Explain (FR-9)
 
@@ -364,8 +378,7 @@ The facade's operations are exposed as an interface, so application code depends
 type Querier interface {
     Query(ctx context.Context, sql string, args ...any) (Rows, error)
     Exec(ctx context.Context, sql string, args ...any) (WriteResult, error)
-    // Added in later milestones:
-    Begin(ctx context.Context, target TxTarget) (Tx, error)              // M5
+    // Added in a later milestone:
     Explain(ctx context.Context, sql string, args ...any) (Explain, error) // M7
 }
 // *shard.DB implements Querier.
@@ -482,7 +495,7 @@ db, err := shard.Open(ctx, cfg)
 
 Sentinel errors, wrapped with context, usable with `errors.Is`:
 
-`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig`, `ErrShardKeyImmutable`, `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing` (all in place), and later `ErrCrossShardTx`, `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
+`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig`, `ErrShardKeyImmutable`, `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing`, `ErrCrossShardTx`, `ErrTxDone` (all in place), and later `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
 
 ## 8. Testing strategy
 
