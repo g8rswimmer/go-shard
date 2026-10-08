@@ -54,6 +54,10 @@ type Plan struct {
 	// Reason says why these targets were chosen, for Explain and logs.
 	Reason string
 
+	// GlobalWrite is true for a write to a global table, which goes to every
+	// shard because every shard holds a copy.
+	GlobalWrite bool
+
 	// Rows is set for an INSERT ... VALUES. It lists, for each target shard,
 	// the indexes of the VALUES rows that belong to it.
 	Rows map[router.ShardID][]int

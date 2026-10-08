@@ -30,10 +30,12 @@ type fakeShard struct {
 	query func(ctx context.Context) (rows int, err error)
 	exec  func(ctx context.Context) (affected int64, err error)
 	ping  func(ctx context.Context) error
+	begin error // returned by Begin when set
 
 	mu   sync.Mutex
 	seen []string // SQL of every query and exec, in arrival order
 
+	connections           atomic.Int32 // database connections opened
 	inFlight, maxInFlight atomic.Int32
 	openRows              atomic.Int32
 	cancelledQueries      atomic.Int32
@@ -43,8 +45,11 @@ func (f *fakeShard) db() *sql.DB { return sql.OpenDB(fakeConnector{f}) }
 
 type fakeConnector struct{ f *fakeShard }
 
-func (c fakeConnector) Connect(context.Context) (driver.Conn, error) { return &fakeConn{c.f}, nil }
-func (c fakeConnector) Driver() driver.Driver                        { return fakeDriver{} }
+func (c fakeConnector) Connect(context.Context) (driver.Conn, error) {
+	c.f.connections.Add(1)
+	return &fakeConn{c.f}, nil
+}
+func (c fakeConnector) Driver() driver.Driver { return fakeDriver{} }
 
 type fakeDriver struct{}
 
@@ -54,7 +59,18 @@ type fakeConn struct{ f *fakeShard }
 
 func (c *fakeConn) Prepare(string) (driver.Stmt, error) { return nil, io.ErrUnexpectedEOF }
 func (c *fakeConn) Close() error                        { return nil }
-func (c *fakeConn) Begin() (driver.Tx, error)           { return nil, io.ErrUnexpectedEOF }
+func (c *fakeConn) Begin() (driver.Tx, error) {
+	if c.f.begin != nil {
+		return nil, c.f.begin
+	}
+	c.f.record("BEGIN")
+	return fakeTx{c.f}, nil
+}
+
+type fakeTx struct{ f *fakeShard }
+
+func (t fakeTx) Commit() error   { t.f.record("COMMIT"); return nil }
+func (t fakeTx) Rollback() error { t.f.record("ROLLBACK"); return nil }
 
 func (c *fakeConn) Ping(ctx context.Context) error {
 	if c.f.ping != nil {

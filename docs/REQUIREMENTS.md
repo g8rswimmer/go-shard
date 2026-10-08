@@ -86,7 +86,10 @@ registry.Global("countries")
 
 ### FR-8 Transactions
 - Full ACID transaction scoped to one shard. All statements must route to the same shard, and this is enforced.
-- A transaction that touches a second shard fails with a clear error.
+- A statement that belongs to a second shard fails with a clear error before anything is sent, and the transaction stays usable.
+- A transaction can be started from a shard key (converted to the table's key type), a table and key, or a shard name; it can be read-only and take an isolation level.
+- A transaction is a `Querier`, so code written against it runs unchanged inside one. A helper commits or rolls back automatically (also on a panic), so a transaction cannot be left open.
+- Reads of global tables work inside a transaction; writes to global tables are refused because they touch every shard.
 
 ### FR-9 Query plan / explain
 - `Explain()` returns the routing decision: target shards, why, strategy (single / multi / all), and merge steps.
