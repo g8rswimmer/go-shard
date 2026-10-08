@@ -24,6 +24,11 @@ var (
 
 	// ErrUnknownTable is returned for a table that is not in the registry.
 	ErrUnknownTable = errors.New("shard: table not in the registry")
+
+	// ErrShardKeyImmutable is returned for a statement that would change a
+	// row's shard key. The key decides which shard holds the row, so changing
+	// it would leave the row where lookups no longer find it.
+	ErrShardKeyImmutable = errors.New("shard: shard key cannot be changed")
 )
 
 // Options adjust routing.
@@ -66,6 +71,9 @@ func Route(a analyze.Analysis, reg *registry.Registry, r router.Router, opts Opt
 	if err := rt.resolveTables(); err != nil {
 		return Plan{}, err
 	}
+	if err := rt.checkImmutable(); err != nil {
+		return Plan{}, err
+	}
 
 	// Statements that touch no sharded table.
 	if len(rt.sharded) == 0 {
@@ -76,8 +84,7 @@ func Route(a analyze.Analysis, reg *registry.Registry, r router.Router, opts Opt
 			analyze.ErrUnsupportedQuery, a.Op, rt.insts[a.Target].tbl.Name)
 	}
 	if a.Op == analyze.OpInsert {
-		t := rt.insts[a.Target].tbl
-		return Plan{}, fmt.Errorf("%w: INSERT into %q cannot be routed from the SQL yet; use db.WithShardKey(<%s value>)", ErrShardKeyRequired, t.Name, t.KeyCol)
+		return rt.routeInsert()
 	}
 
 	if err := rt.checkGroup(); err != nil {
@@ -87,6 +94,94 @@ func Route(a analyze.Analysis, reg *registry.Registry, r router.Router, opts Opt
 		return Plan{}, err
 	}
 	return rt.decide(opts)
+}
+
+// checkImmutable refuses statements that change a row's shard key.
+func (rt *routing) checkImmutable() error {
+	a := rt.a
+	if !a.Op.IsWrite() {
+		return nil
+	}
+	in := rt.insts[a.Target]
+	if in.system || in.tbl.Kind == registry.KindGlobal {
+		return nil
+	}
+	var assigned []string
+	switch {
+	case a.Op == analyze.OpUpdate:
+		assigned = a.SetColumns
+	case a.Op == analyze.OpInsert && a.Insert != nil:
+		assigned = a.Insert.ConflictSet
+	default:
+		// DELETE assigns nothing; an INSERT without ON CONFLICT DO UPDATE neither
+	}
+	for _, col := range assigned {
+		if col == in.tbl.KeyCol {
+			return fmt.Errorf("%w: %s of %q assigns its shard key column %q; the key decides which shard holds the row, "+
+				"so to move a row, delete it and insert it again with the new key", ErrShardKeyImmutable, a.Op, in.tbl.Name, col)
+		}
+	}
+	return nil
+}
+
+// routeInsert groups the VALUES rows of an INSERT by the shard that owns each
+// row's key.
+func (rt *routing) routeInsert() (Plan, error) {
+	t := rt.insts[rt.a.Target].tbl
+	in := rt.a.Insert
+	hint := fmt.Sprintf("use db.WithShardKey(<%s value>) to say where it goes", t.KeyCol)
+
+	switch {
+	case in == nil:
+		return Plan{}, fmt.Errorf("%w: INSERT ... SELECT and INSERT ... DEFAULT VALUES into %q cannot be routed, because the key is not known until the statement runs; %s",
+			analyze.ErrUnsupportedQuery, t.Name, hint)
+	case len(in.Columns) == 0:
+		return Plan{}, fmt.Errorf("%w: INSERT into %q must name its columns, so the shard key column %q can be found", ErrShardKeyRequired, t.Name, t.KeyCol)
+	default:
+		// the rows and columns are known
+	}
+
+	keyAt := -1
+	for i, c := range in.Columns {
+		if c == t.KeyCol {
+			keyAt = i
+		}
+	}
+	if keyAt < 0 {
+		return Plan{}, fmt.Errorf("%w: INSERT into %q does not set its shard key column %q; %s", ErrShardKeyRequired, t.Name, t.KeyCol, hint)
+	}
+
+	byShard := map[router.ShardID][]int{}
+	for i, row := range in.Rows {
+		switch {
+		case len(row) != len(in.Columns):
+			return Plan{}, fmt.Errorf("%w: row %d of the INSERT into %q has %d values for %d columns", analyze.ErrUnsupportedQuery, i, t.Name, len(row), len(in.Columns))
+		case !row[keyAt].Known:
+			return Plan{}, fmt.Errorf("%w: the shard key %q in row %d of the INSERT into %q is not a literal or a parameter (a function call, expression or DEFAULT?); "+
+				"compute the key in your application and pass it as a value", ErrShardKeyRequired, t.KeyCol, i, t.Name)
+		default:
+			// a value we can hash
+		}
+		key, err := coerceKey(row[keyAt].Value, t.KeyType)
+		if err != nil {
+			return Plan{}, fmt.Errorf("shard key %s.%s in row %d: %w", t.Name, t.KeyCol, i, err)
+		}
+		id, err := rt.r.ShardFor(key)
+		if err != nil {
+			return Plan{}, fmt.Errorf("shard key %s.%s in row %d: %w", t.Name, t.KeyCol, i, err)
+		}
+		byShard[id] = append(byShard[id], i)
+	}
+
+	ids := make([]router.ShardID, 0, len(byShard))
+	for id := range byShard {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	p := rt.plan(ids, fmt.Sprintf("INSERT of %d row(s) by %s.%s", len(in.Rows), t.Name, t.KeyCol))
+	p.Rows = byShard
+	return p, nil
 }
 
 // inst is one table use with its registry entry.

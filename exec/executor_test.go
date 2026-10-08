@@ -180,10 +180,10 @@ func TestExecDoesNotFailFast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out[0].Shard != "s0" || out[0].Err == nil || out[0].Result != nil {
+	if out[0].Shard != "s0" || out[0].Err == nil || out[0].RowsAffected != 0 {
 		t.Errorf("s0 outcome = %+v, want the failure", out[0])
 	}
-	if n, _ := out[1].Result.RowsAffected(); out[1].Shard != "s1" || out[1].Err != nil || n != 7 {
+	if out[1].Shard != "s1" || out[1].Err != nil || out[1].RowsAffected != 7 {
 		t.Errorf("s1 outcome = %+v, want 7 rows affected: a failure elsewhere must not cancel it", out[1])
 	}
 }
@@ -271,5 +271,47 @@ func TestOpenErrorsNameTheShardNotTheDSN(t *testing.T) {
 				t.Errorf("error leaks the password: %v", err)
 			}
 		})
+	}
+}
+
+func TestExecSendsEachShardItsOwnStatement(t *testing.T) {
+	a, b, c := &fakeShard{}, &fakeShard{}, &fakeShard{}
+	pool := newPool(t, a, b, c)
+	p := plan.Plan{
+		SQL:     "INSERT everything",
+		Targets: []router.ShardID{"s0", "s1", "s2"},
+		PerShard: map[router.ShardID]plan.ShardStatement{
+			"s0": {SQL: "INSERT rows 0 and 2"},
+			"s1": {SQL: "INSERT row 1"},
+		},
+		Rows: map[router.ShardID][]int{"s0": {0, 2}, "s1": {1}},
+	}
+	out, err := NewExecutor(pool, Options{}).Exec(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for fake, want := range map[*fakeShard]string{a: "INSERT rows 0 and 2", b: "INSERT row 1", c: "INSERT everything"} {
+		if got := fake.queries(); len(got) != 1 || got[0] != want {
+			t.Errorf("a shard ran %v, want [%q]", got, want)
+		}
+	}
+	if fmt.Sprint(out[0].Rows) != "[0 2]" || fmt.Sprint(out[1].Rows) != "[1]" || out[2].Rows != nil {
+		t.Errorf("outcomes must report the rows each shard received: %+v", out)
+	}
+}
+
+func TestQueryUsesThePerShardStatement(t *testing.T) {
+	f := &fakeShard{query: func(context.Context) (int, error) { return 1, nil }}
+	pool := newPool(t, f)
+	p := plan.Plan{SQL: "generic", Targets: []router.ShardID{"s0"},
+		PerShard: map[router.ShardID]plan.ShardStatement{"s0": {SQL: "specific"}}}
+	got, err := NewExecutor(pool, Options{}).Query(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = got[0].Rows.Close()
+	if q := f.queries(); len(q) != 1 || q[0] != "specific" {
+		t.Errorf("ran %v, want the per-shard statement", q)
 	}
 }

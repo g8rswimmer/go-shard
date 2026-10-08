@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/g8rswimmer/go-shard/analyze"
+	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -45,6 +46,10 @@ type Config struct {
 	// ShardTimeout limits each shard's work, including streaming its rows.
 	// Zero means no limit beyond the caller's context.
 	ShardTimeout time.Duration
+	// IdempotencyTable is where idempotency keys are recorded, on every shard.
+	// It may be a name or schema.name. The default is go_shard_idempotency_keys.
+	// Create it with DB.EnsureIdempotencyTable or your own migrations.
+	IdempotencyTable string
 	// Analyzer reads raw SQL to find where it belongs. The default uses
 	// PostgreSQL's own parser, which needs cgo; without cgo the default is
 	// none, and only WithShardKey / WithShard / WithAllShards and built
@@ -69,6 +74,9 @@ func (c Config) validate() (*router.HashRouter, error) {
 	}
 	if c.ShardTimeout < 0 {
 		add("ShardTimeout cannot be negative")
+	}
+	if c.IdempotencyTable != "" && !exec.ValidTableName(c.IdempotencyTable) {
+		add("IdempotencyTable %q is not a valid table name (use name or schema.name)", c.IdempotencyTable)
 	}
 
 	seen := map[ShardID]bool{}

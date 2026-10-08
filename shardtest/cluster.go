@@ -65,6 +65,7 @@ func WithPostgresVersion(v string) Option { return func(o *options) { o.pgVersio
 type Cluster struct {
 	ids  []shard.ShardID
 	dsns map[shard.ShardID]string
+	ctrs map[shard.ShardID]*postgres.PostgresContainer // empty when using SHARDTEST_DSNS
 
 	mu     sync.Mutex
 	direct map[shard.ShardID]*sql.DB
@@ -91,6 +92,7 @@ func NewCluster(t testing.TB, n int, opts ...Option) *Cluster {
 	env := os.Getenv(envDSNs)
 	external := env != ""
 	var dsns []string
+	var ctrs []*postgres.PostgresContainer
 	switch {
 	case external:
 		var err error
@@ -99,14 +101,21 @@ func NewCluster(t testing.TB, n int, opts ...Option) *Cluster {
 		}
 		t.Logf("shardtest: using %d existing shards from %s; resetting their public schema", n, envDSNs)
 	default:
-		dsns = startContainers(ctx, t, n, o.pgVersion)
+		dsns, ctrs = startContainers(ctx, t, n, o.pgVersion)
 	}
 
-	c := &Cluster{dsns: map[shard.ShardID]string{}, direct: map[shard.ShardID]*sql.DB{}}
+	c := &Cluster{
+		dsns:   map[shard.ShardID]string{},
+		ctrs:   map[shard.ShardID]*postgres.PostgresContainer{},
+		direct: map[shard.ShardID]*sql.DB{},
+	}
 	for i, dsn := range dsns {
 		id := shard.ShardID(fmt.Sprintf("shard-%02d", i+1))
 		c.ids = append(c.ids, id)
 		c.dsns[id] = dsn
+		if ctrs != nil {
+			c.ctrs[id] = ctrs[i]
+		}
 	}
 	t.Cleanup(c.closeDirect)
 
@@ -135,7 +144,7 @@ func externalDSNs(env string, n int) ([]string, error) {
 }
 
 // startContainers starts n PostgreSQL containers in parallel.
-func startContainers(ctx context.Context, t testing.TB, n int, version string) []string {
+func startContainers(ctx context.Context, t testing.TB, n int, version string) ([]string, []*postgres.PostgresContainer) {
 	t.Helper()
 	type result struct {
 		ctr *postgres.PostgresContainer
@@ -165,8 +174,10 @@ func startContainers(ctx context.Context, t testing.TB, n int, version string) [
 	wg.Wait()
 
 	dsns := make([]string, n)
+	ctrs := make([]*postgres.PostgresContainer, n)
 	var errs []error
 	for i, r := range results {
+		ctrs[i] = r.ctr
 		if r.ctr != nil {
 			testcontainers.CleanupContainer(t, r.ctr)
 		}
@@ -178,7 +189,27 @@ func startContainers(ctx context.Context, t testing.TB, n int, version string) [
 	if err := errors.Join(errs...); err != nil {
 		t.Fatalf("shardtest: starting postgres:%s containers (is Docker running?): %v", version, err)
 	}
-	return dsns
+	return dsns, ctrs
+}
+
+// Stop shuts a shard down, as an outage would: new connections are refused and
+// running ones are dropped. It cannot be undone. A stopped container comes
+// back on a different port, so a DB opened earlier does not reconnect; use Stop
+// to test how code behaves while a shard is down.
+//
+// It skips the test when the cluster uses existing databases
+// (SHARDTEST_DSNS), because there is nothing to stop.
+func (c *Cluster) Stop(t testing.TB, id shard.ShardID) {
+	t.Helper()
+	ctr, ok := c.ctrs[id]
+	if !ok {
+		t.Skipf("shardtest: cannot stop %s: the cluster uses existing databases (%s), not containers", id, envDSNs)
+		return
+	}
+	timeout := 5 * time.Second
+	if err := ctr.Stop(context.Background(), &timeout); err != nil {
+		t.Fatalf("shardtest: stopping %s: %v", id, err)
+	}
 }
 
 // IDs returns the shard IDs in order: shard-01, shard-02, ...

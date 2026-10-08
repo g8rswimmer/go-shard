@@ -37,6 +37,20 @@ var (
 	// ErrMissingArgument is returned when the SQL uses a parameter, such as $3,
 	// that has no argument.
 	ErrMissingArgument = analyze.ErrMissingArgument
+
+	// ErrShardKeyImmutable is returned for a statement that would change a
+	// row's shard key: an UPDATE that sets it, or an INSERT ... ON CONFLICT DO
+	// UPDATE that does. To move a row, delete it and insert it with the new key.
+	ErrShardKeyImmutable = plan.ErrShardKeyImmutable
+
+	// ErrIdempotencyKeyReused is returned when an idempotency key that was used
+	// for one statement is used for a different one.
+	ErrIdempotencyKeyReused = exec.ErrIdempotencyKeyReused
+
+	// ErrIdempotencyTableMissing is returned when an idempotency key is used but
+	// the table that records keys does not exist on a shard. Create it with
+	// DB.EnsureIdempotencyTable.
+	ErrIdempotencyTableMissing = exec.ErrIdempotencyTableMissing
 )
 
 // ShardError reports which shard a failure came from. Use errors.As to read it.

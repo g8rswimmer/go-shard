@@ -35,12 +35,13 @@ import (
 
 // DB is a set of shards. It is safe for concurrent use. Close it when done.
 type DB struct {
-	registry *registry.Registry
-	router   *router.HashRouter
-	pool     *exec.Pool
-	exec     *exec.Executor
-	analyzer analyze.Analyzer // nil when raw SQL cannot be analyzed (no cgo)
-	next     atomic.Uint64    // spreads statements any shard can answer
+	registry  *registry.Registry
+	router    *router.HashRouter
+	pool      *exec.Pool
+	exec      *exec.Executor
+	analyzer  analyze.Analyzer // nil when raw SQL cannot be analyzed (no cgo)
+	idemTable string           // where idempotency keys are recorded
+	next      atomic.Uint64    // spreads statements any shard can answer
 }
 
 var _ Querier = (*DB)(nil)
@@ -70,12 +71,17 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if analyzer == nil {
 		analyzer = defaultAnalyzer()
 	}
+	idemTable := cfg.IdempotencyTable
+	if idemTable == "" {
+		idemTable = exec.DefaultIdempotencyTable
+	}
 	return &DB{
-		registry: cfg.Registry,
-		router:   r,
-		pool:     pool,
-		exec:     exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout}),
-		analyzer: analyzer,
+		idemTable: idemTable,
+		registry:  cfg.Registry,
+		router:    r,
+		pool:      pool,
+		exec:      exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout}),
+		analyzer:  analyzer,
 	}, nil
 }
 

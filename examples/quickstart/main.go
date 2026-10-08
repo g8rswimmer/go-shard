@@ -1,6 +1,6 @@
-// Quickstart shows the basics: describe your tables, open the shards, write a
-// row to the shard that owns its key, then read and update it with plain SQL.
-// The library finds the shard from the shard key in the SQL.
+// Quickstart shows the basics: describe your tables, open the shards, then
+// write, read and update rows with plain SQL. The library finds the shard from
+// the shard key in the SQL.
 //
 // It uses the three local shards from `make up`. Set SHARD_DSNS (comma
 // separated) to use others.
@@ -72,8 +72,8 @@ func run() error {
 		_, _ = db.WithAllShards().Exec(context.Background(), "DROP TABLE IF EXISTS profiles")
 	}()
 
-	// 4. Write: WithShardKey picks the shard that owns this id. (Routing an
-	// INSERT from its VALUES is not available yet.)
+	// 4. Write: the library reads the id from the VALUES and sends the row to
+	// the shard that owns it.
 	names := map[int64]string{1: "Ada", 2: "Grace", 3: "Edsger", 4: "Barbara", 5: "Alan", 6: "Margaret"}
 	ids := make([]int64, 0, len(names))
 	for id := range names {
@@ -82,7 +82,7 @@ func run() error {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	for _, id := range ids {
-		res, err := db.WithShardKey(id).Exec(ctx,
+		res, err := db.Exec(ctx,
 			"INSERT INTO profiles (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
 			id, names[id])
 		if err != nil {

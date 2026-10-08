@@ -53,6 +53,16 @@ func TestBuilderAndParserAgree(t *testing.T) {
 		{"update set", query.Update("profiles").Set("name", "x").Where(query.In("id", k.k1, k.k2))},
 		{"update without key", query.Update("profiles").Set("name", "x")},
 		{"update global", query.Update("countries").Set("name", "x").Where(query.Eq("code", "US"))},
+		{"insert one row", query.InsertInto("profiles").Columns("id", "name").Row(42, "x")},
+		{"insert rows on one shard", query.InsertInto("profiles").Columns("id", "name").Row(k.same1, "a").Row(k.same2, "b")},
+		{"insert rows on two shards", query.InsertInto("profiles").Columns("id", "name").Row(k.k1, "a").Row(k.k2, "b").Row(k.k1, "c")},
+		{"insert key last", query.InsertInto("profiles").Columns("name", "id").Row("a", 42)},
+		{"insert without the key", query.InsertInto("profiles").Columns("name").Row("a")},
+		{"insert into global", query.InsertInto("countries").Columns("code").Row("US")},
+		{"insert into colocated", query.InsertInto("addresses").Columns("id", "profile_id").Row(1, 42)},
+		{"upsert", query.InsertInto("profiles").Columns("id", "name").Row(42, "x").OnConflictUpdate([]string{"id"}, "name")},
+		{"upsert of the key", query.InsertInto("profiles").Columns("id", "name").Row(42, "x").OnConflictUpdate([]string{"id"}, "id")},
+		{"update of the key", query.Update("profiles").Set("id", 5).Where(query.Eq("id", 1))},
 		{"delete by key", query.DeleteFrom("profiles").Where(query.Eq("id", &three))},
 		{"delete global", query.DeleteFrom("countries")},
 		{"unknown table", query.From("mystery").Where(query.Eq("id", 1))},
@@ -80,6 +90,7 @@ func TestBuilderAndParserAgree(t *testing.T) {
 				{"Op", got.Op, want.Op}, {"Scopes", got.Scopes, want.Scopes}, {"Tables", got.Tables, want.Tables},
 				{"Target", got.Target, want.Target}, {"Bindings", got.Bindings, want.Bindings},
 				{"Equalities", got.Equalities, want.Equalities}, {"OrderBy", got.OrderBy, want.OrderBy},
+				{"Insert", got.Insert, want.Insert}, {"SetColumns", got.SetColumns, want.SetColumns},
 				{"Limit", deref(got.Limit), deref(want.Limit)}, {"Offset", deref(got.Offset), deref(want.Offset)},
 			} {
 				if !reflect.DeepEqual(f.got, f.wnt) {
@@ -98,6 +109,9 @@ func TestBuilderAndParserAgree(t *testing.T) {
 					t.Errorf("different errors:\nbuilder: %v\nparser:  %v", berr, perr)
 				}
 				return
+			}
+			if fmt.Sprint(bp.Rows) != fmt.Sprint(pp.Rows) {
+				t.Errorf("builder assigns rows %v, parser %v", bp.Rows, pp.Rows)
 			}
 			if fmt.Sprint(bp.Targets, bp.Strategy) != fmt.Sprint(pp.Targets, pp.Strategy) {
 				t.Errorf("builder routes to %v %v, parser to %v %v", bp.Targets, bp.Strategy, pp.Targets, pp.Strategy)
@@ -124,3 +138,40 @@ func unwrapSentinel(err error) string {
 }
 
 func errorsIs(err, target error) bool { return errors.Is(err, target) }
+
+// Splitting a built INSERT and splitting its SQL with the parser give the same
+// rows, whichever shard-by-shard route is taken.
+func TestBuilderAndParserSplitAgree(t *testing.T) {
+	st, err := query.InsertInto("profiles").Columns("id", "name", "note").
+		Row(1, "a", "x").Row(2, "b", "y").Row(3, "c", "z").Row(4, "d", "w").
+		OnConflictDoNothing().Returning("id").Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parser := pgparse.New()
+
+	for _, rows := range [][]int{{0}, {3}, {1, 2}, {3, 0, 2}, {0, 1, 2, 3}} {
+		bSQL, bArgs, err := st.SplitRows(rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pSQL, pArgs, err := parser.SplitRows(st.SQL(), st.Args(), rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ba, err := parser.FromSQL(bSQL, bArgs)
+		if err != nil {
+			t.Fatalf("rows %v: the parser cannot read the builder's split %q: %v", rows, bSQL, err)
+		}
+		pa, err := parser.FromSQL(pSQL, pArgs)
+		if err != nil {
+			t.Fatalf("rows %v: cannot read the parser's split %q: %v", rows, pSQL, err)
+		}
+		if !reflect.DeepEqual(ba.Insert, pa.Insert) {
+			t.Errorf("rows %v differ:\nbuilder: %+v\nparser:  %+v", rows, ba.Insert, pa.Insert)
+		}
+		if len(ba.Insert.Rows) != len(rows) {
+			t.Errorf("rows %v: split has %d rows", rows, len(ba.Insert.Rows))
+		}
+	}
+}

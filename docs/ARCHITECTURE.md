@@ -48,7 +48,6 @@ go-shard/
   plan/               Plan type, strategies, Explain rendering (FR-9)
   exec/               Shard pool, parallel executor, tx pinning (FR-1, FR-8)
   merge/              Ordered merge, limit/offset, distinct, aggregates (FR-5)
-  write/              Row splitting, per-shard results, idempotency (FR-7)
   migrate/            Fan-out migration runner, status, drift (FR-10)
   observe/            Hooks interface, slog adapter; otel/ subpackage (FR-11)
   shardtest/          Public test support: containers, fake, assertions (FR-13)
@@ -60,8 +59,8 @@ go-shard/
 Dependency direction (arrows mean "imports"). Nothing imports the facade, and only `analyze/pgparse` imports cgo:
 
 ```
-shard -> plan, exec, merge, write, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
-plan, write -> router, registry, analyze
+shard -> plan, exec, merge, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
+plan -> router, registry, analyze
 query -> analyze
 exec, merge, migrate -> (types from plan/registry only)
 analyze -> registry
@@ -110,6 +109,8 @@ type Analysis struct {
     Scopes     []int  // Scopes[i] = parent query level of level i; level 0 is the statement
     Tables     []TableRef   // every table use: ID, Scope, Schema, Name, Alias
     Target     int          // table written by INSERT / UPDATE / DELETE
+    Insert     *Insert      // VALUES rows of an INSERT: Columns, Rows of Cell{Value, Known}, ConflictSet
+    SetColumns []string     // columns an UPDATE assigns
     Equalities []Equality   // a.col = b.col (WHERE, and ON), AND-ed
     Bindings   []Binding    // col = 5, col IN (1,2), col = ANY($1): parameters already resolved
     Usings     []Using      // JOIN ... USING (cols)
@@ -120,6 +121,11 @@ type Analysis struct {
 }
 type Analyzer interface {
     FromSQL(sql string, args []any) (Analysis, error)
+}
+// Optional: an analyzer that can restrict an INSERT to some of its rows, needed
+// to send a multi-row INSERT to several shards. pgparse implements it.
+type RowSplitter interface {
+    SplitRows(sql string, args []any, rows []int) (string, []any, error)
 }
 // A built query.Statement produces its Analysis directly, without parsing.
 
@@ -197,7 +203,10 @@ SELECT ... ORDER BY created_at DESC LIMIT 20   (WithAllShards)
 | A write to a global table that also uses a sharded table | `ErrUnsupportedQuery` (split it) |
 | A table not in the registry | `ErrUnknownTable` |
 | Sharded or colocated tables from more than one colocation group | `ErrCrossShardJoin`, naming the alternatives |
-| `INSERT` into a sharded table | `ErrShardKeyRequired` for now; routing from `VALUES` arrives with writes (M4) |
+| `INSERT ... VALUES` into a sharded or colocated table | Each row goes to the shard that owns its key (see 5.6) |
+| `INSERT` whose rows are not known (`INSERT ... SELECT`, `DEFAULT VALUES`) | `ErrUnsupportedQuery` |
+| `INSERT` that does not name its columns, omits the key column, or whose key is `DEFAULT`, NULL, a function or an expression | `ErrShardKeyRequired`, saying what to do |
+| `UPDATE` that assigns the shard key, or `INSERT ... ON CONFLICT DO UPDATE` that does | `ErrShardKeyImmutable` |
 | DDL and other non-DML statements | `ErrUnsupportedQuery`: use `WithAllShards()` or the migrations runner |
 
 **Joins and subqueries.** Every use of a sharded/colocated table (in the FROM clause or in any subquery) is a node. Nodes are tied together by shard-key equality: `ON a.key = b.key`, `USING (key)`, or a correlated subquery condition. Each resulting group is limited to the shards its key conditions allow.
@@ -252,8 +261,10 @@ Two producers of `Analysis`, one consumer (`plan.Route`):
 - Each shard call gets its own context with the per-shard timeout (if any), derived from the caller's context. The timeout covers streaming the rows too, so `exec.Rows` releases the context on `Close`: rows must always be closed.
 - **Reads fail fast** (first error cancels the other shards' queries and closes any result sets already open). The cancellation is wired with `context.AfterFunc` and removed once each query returns, so cancelling on exit never cuts off rows the caller is still reading. A test pins this.
 - **Writes do not fail fast.** Every target is attempted and each outcome is reported, because a write that succeeded on some shards must be visible. The facade turns the outcomes into a `WriteResult` plus an error if any shard failed.
+- A plan may give each shard its own statement (`Plan.PerShard`, read through `Plan.StatementFor`): this is how a multi-row INSERT sends every shard only its rows. `ShardExec` also reports the VALUES rows the shard received and whether the write was a replay.
+- `Executor.ExecIdempotent` runs the same fan-out with the idempotency protocol of 5.6.
 - `AllowPartial()` for reads (rows plus a `[]ShardError`) arrives with the merge layer in M6.
-- Reads can be retried once on connection errors. Writes are never retried unless an idempotency key is supplied (FR-7). (Retries are not implemented yet.)
+- Reads can be retried once on connection errors; this is not implemented yet. Writes are never retried by the library: a retry is the caller's, made safe by an idempotency key (5.6).
 - Rows are streamed per shard so the merger can start before all shards finish.
 
 ### 5.5 Merger (FR-5)
@@ -275,12 +286,30 @@ Memory is bounded by `MaxMergeRows`; exceeding it fails the query rather than ex
 
 ### 5.6 Writes (FR-7)
 
-- **Insert:** the shard key is read from the row (builder) or the `VALUES` list (raw SQL). Missing key is `ErrShardKeyRequired`.
-- **Batch insert:** rows are grouped by target shard, one statement per shard, executed in parallel.
-- **Update / delete:** must carry a shard-key predicate (same rules as reads). An update that sets the shard-key column is rejected before execution.
-- **Global tables:** the write goes to every shard.
-- **Result:** `WriteResult{ PerShard map[ShardID]ShardOutcome }`, with rows affected or the error for each shard. A returned error means at least one shard failed; the result still shows which succeeded. There is no atomicity across shards.
-- **Idempotency key:** optional. The key is stored in an `idempotency_keys` table on each affected shard and checked in the same single-shard transaction as the write, so a retry of a partially failed batch only re-applies on shards that did not commit.
+**INSERT.** The analyzer reads the `VALUES` rows (`analyze.Insert`: the column names, and for each row a `Cell` that is `Known` only if it is a literal or parameter). `plan.Route` finds the shard key column, converts each row's key to the declared type, and assigns the row to the shard that owns it (`Plan.Rows`: shard to row indexes). A row whose key is `DEFAULT`, NULL, a function call or an expression cannot be placed, and refuses the whole statement before anything is written; so does a missing key column or an `INSERT` with no column list.
+
+**Splitting.** If the rows belong to more than one shard, each shard gets a statement holding only its rows:
+- Raw SQL: `pgparse` parses the statement, keeps the chosen rows in the `VALUES` list, renumbers `$n` from 1 in the order the statement uses them, drops arguments no longer used, and deparses with PostgreSQL's own deparser. Field order is fixed, so the same input always gives the same text (the idempotency check relies on this). `ON CONFLICT` and `RETURNING` are kept.
+- Built statements (`query.InsertInto`): the builder renders the chosen rows directly.
+- An analyzer that cannot split (not a `RowSplitter`) gives `ErrUnsupportedQuery` for a multi-shard insert and says to insert in separate calls.
+
+**Update / delete** follow the same rules as reads. An `UPDATE` that assigns the shard key column, or an upsert whose `DO UPDATE SET` does, is `ErrShardKeyImmutable`. Moving a row means deleting it and inserting it again.
+
+**Global tables:** the write goes to every shard.
+
+**Result.** `WriteResult{PerShard map[ShardID]ShardOutcome}`. Each outcome has `RowsAffected`, `Err`, `Rows` (the indexes of the VALUES rows that shard received) and `Replayed`. A returned error means at least one shard failed; the result still shows every shard. There is no atomicity across shards. Helpers: `RowsAffected()` (successful shards only), `Failed()` (error per failed shard) and `FailedRows()` (sorted indexes of the rows that went to failed shards, i.e. what to send again).
+
+**Idempotency.** `shard.WithIdempotencyKey(ctx, key)` makes `Exec` / `ExecStatement` safe to retry. On each affected shard, in one transaction:
+
+1. `INSERT INTO <idempotency table> (key, request_hash) ... ON CONFLICT (key) DO NOTHING`.
+2. If that inserted nothing the key is already there: read the stored hash and `rows_affected`, roll back, and report a replay with the stored count. A different hash is `ErrIdempotencyKeyReused`.
+3. Otherwise run the write, record `rows_affected`, and commit.
+
+Because the key and the write commit or roll back together, a shard where the write failed has no key and a retry applies it; a shard that committed has the key and a retry skips it. Concurrent callers with the same key are serialized by the primary key: the second blocks on the first's transaction, then sees the key and replays (tested with 12 simultaneous callers: exactly one applies).
+
+The hash covers the statement text and the arguments (times are normalised, so the instant is compared, not its representation). A retry therefore has to send exactly what the first attempt sent; for a split INSERT that means the same rows, which is why splitting is deterministic. The key is per call, so a context carrying a key should be used for one write; `Query` ignores it.
+
+The table (default `go_shard_idempotency_keys`, set with `Config.IdempotencyTable`, may be `schema.name`) is never created implicitly: `DB.EnsureIdempotencyTable` creates it on every shard, or add `shard.IdempotencyDDL(table)` to your migrations. If it is missing the write is refused with `ErrIdempotencyTableMissing` and instructions. `DB.PruneIdempotencyKeys(ctx, olderThan)` removes old keys on every shard.
 
 ### 5.7 Transactions (FR-8)
 
@@ -342,19 +371,16 @@ type Querier interface {
 // *shard.DB implements Querier.
 ```
 
-Today (M2) the caller supplies the routing, with handles that are themselves `Querier`s:
+Plain `db.Query` / `db.Exec` route from the SQL. The explicit overrides (FR-4), which skip analysis, are handles that are themselves `Querier`s:
 
 ```go
 db.WithShardKey(id).Exec(ctx, "INSERT INTO profiles ...", id, name)  // shard that owns id
 db.WithShard("shard-02").Query(ctx, "SELECT ...")                     // a named shard
 db.WithAllShards().Exec(ctx, "CREATE TABLE ...")                      // every shard
-db.Query(ctx, "SELECT ...")                                           // ErrShardKeyRequired until M3
 ```
 
-When the analyzer arrives (M3), plain `db.Query` routes from the SQL and these become the explicit overrides from FR-4.
-
 - `Rows` is an interface (`Next`, `Scan`, `Columns`, `Err`, `Close`) that `*sql.Rows` satisfies and merged results will too.
-- `WriteResult{PerShard map[ShardID]ShardOutcome}` is defined now, so M4 adds batch splitting and idempotency without changing the type. A write that fails on any shard returns an error and the result still lists every shard.
+- `WriteResult{PerShard map[ShardID]ShardOutcome}`: see 5.6. A write that fails on any shard returns an error and the result still lists every shard.
 - `Query` on more than one shard returns `ErrUnsupportedQuery` until merging exists (M6).
 
 `shardtest` provides these tools (the fake and the routing assertions arrive in M7):
@@ -362,7 +388,7 @@ When the analyzer arrives (M3), plain `db.Query` routes from the SQL and these b
 | Tool | Use |
 |---|---|
 | `shardtest.NewCluster(t, n, opts...)` | Starts `n` Postgres containers in parallel (testcontainers; image from `WithPostgresVersion`, `SHARDTEST_POSTGRES_VERSION`, default 14) named `shard-01`..., and registers cleanup with `t.Cleanup`. Applying migrations (`WithMigrations`) arrives with M8. If `SHARDTEST_DSNS` is set, it uses those instances instead and **drops and recreates their `public` schema** at the start of each test; tests sharing them must run with `go test -p 1`. |
-| Cluster helpers (M2) | `cluster.Open(t, reg)` opens a `*shard.DB` and closes it at cleanup; `Config(reg)`; `IDs()`; `DSN(id)`; `ExecAll(t, sql)` runs DDL on every shard; `Direct(t, id)` returns a plain `*sql.DB` that bypasses go-shard, so a test can assert where a row physically is; `Count(t, id, sql)`; `Seed(t, db, table, rows...)` inserts each row on the shard that owns it (global tables on every shard). |
+| Cluster helpers (M2) | `cluster.Open(t, reg)` opens a `*shard.DB` and closes it at cleanup; `Config(reg)`; `IDs()`; `DSN(id)`; `ExecAll(t, sql)` runs DDL on every shard; `Direct(t, id)` returns a plain `*sql.DB` that bypasses go-shard, so a test can assert where a row physically is; `Count(t, id, sql)`; `Stop(t, id)` shuts a container down to test a real outage (it skips the test when the cluster uses `SHARDTEST_DSNS`); `Seed(t, db, table, rows...)` inserts each row on the shard that owns it (global tables on every shard). |
 | `shardtest.NewFake(reg, shards...)` | In-memory `Querier`. Runs the real Analyze, Route and Plan stages but records the plan instead of executing, and returns canned rows set with `fake.Returns(...)`. No database needed. |
 | Assertions | `shardtest.AssertRoutes(t, q, sql, args, wantShards...)`, `AssertSingleShard`, `AssertFanout`, and `cluster.Seed(t, table, rows)`, which inserts each row on its owning shard. |
 
@@ -456,7 +482,7 @@ db, err := shard.Open(ctx, cfg)
 
 Sentinel errors, wrapped with context, usable with `errors.Is`:
 
-`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig` (all in place), and later `ErrCrossShardTx`, `ErrShardKeyImmutable`, `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
+`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig`, `ErrShardKeyImmutable`, `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing` (all in place), and later `ErrCrossShardTx`, `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
 
 ## 8. Testing strategy
 
@@ -506,7 +532,8 @@ Resolved from REQUIREMENTS section 7:
 - Bucket count and storage: 1024 virtual buckets, static config.
 - Parser: `pg_query_go`, isolated behind `Analyzer`.
 - Minimum versions: Go 1.26, PostgreSQL 14+.
-- Builder: a small fluent builder in its own package `query` (SELECT / UPDATE / DELETE); INSERT arrives with M4.
+- Builder: a small fluent builder in its own package `query` (SELECT / INSERT / UPDATE / DELETE).
+- Idempotency table: created explicitly with `DB.EnsureIdempotencyTable` or by the user's migrations (`shard.IdempotencyDDL`), never implicitly at first use.
 - Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
 - Migrations: wrap `golang-migrate` behind `Migrator`.
 
@@ -514,4 +541,3 @@ Still open (decide in the project plan or early implementation):
 
 - Whether `observe/otel` is a separate Go module to keep the core dependency-free.
 - Typed repositories on top of the builder (the fluent builder itself is done in M3).
-- Where the idempotency-key table is created (by the library's own migration vs the user's migrations).

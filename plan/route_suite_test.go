@@ -115,13 +115,14 @@ func TestRoutingSuite(t *testing.T) {
 
 	// Expectations. Exactly one of the fields in want is set.
 	type want struct {
-		keys     []any            // routed by these keys: targets are the shards they hash to
-		shards   []router.ShardID // routed to exactly these shards
-		any      bool             // any one shard
-		all      bool             // every shard (strategy All)
-		strategy plan.Strategy    // checked when non-zero
-		err      error            // errors.Is
-		errHas   string           // substring of the error
+		keys     []any                    // routed by these keys: targets are the shards they hash to
+		shards   []router.ShardID         // routed to exactly these shards
+		any      bool                     // any one shard
+		all      bool                     // every shard (strategy All)
+		rows     map[router.ShardID][]int // for INSERT: which VALUES rows go to which shard
+		strategy plan.Strategy            // checked when non-zero
+		err      error                    // errors.Is
+		errHas   string                   // substring of the error
 	}
 	cases := []struct {
 		name string
@@ -186,7 +187,48 @@ func TestRoutingSuite(t *testing.T) {
 		{"UPDATE RETURNING", "UPDATE profiles SET name = 'x' WHERE id = $1 RETURNING id", []any{42}, want{keys: []any{42}}},
 		{"UPDATE without key", "UPDATE profiles SET name = 'x'", nil, want{err: plan.ErrShardKeyRequired}},
 		{"DELETE without key", "DELETE FROM profiles WHERE name = 'x'", nil, want{err: plan.ErrShardKeyRequired}},
-		{"INSERT into sharded table", "INSERT INTO profiles (id, name) VALUES (1, 'x')", nil, want{err: plan.ErrShardKeyRequired, errHas: "WithShardKey"}},
+		// ---- INSERT ------------------------------------------------------------
+		{"INSERT one row, literal key", "INSERT INTO profiles (id, name) VALUES (42, 'x')", nil, want{keys: []any{42}, strategy: plan.Single, rows: map[router.ShardID][]int{shardOf(42): {0}}}},
+		{"INSERT one row, parameters", "INSERT INTO profiles (id, name) VALUES ($1, $2)", []any{42, "x"}, want{keys: []any{42}}},
+		{"INSERT with the key column second", "INSERT INTO profiles (name, id) VALUES ($1, $2)", []any{"x", 42}, want{keys: []any{42}}},
+		{"INSERT with a text key for an int column", "INSERT INTO profiles (id, name) VALUES ('42', 'x')", nil, want{keys: []any{42}}},
+		{"INSERT with a cast key", "INSERT INTO profiles (id, name) VALUES ($1::bigint, 'x')", []any{42}, want{keys: []any{42}}},
+		{"INSERT ... RETURNING", "INSERT INTO profiles (id, name) VALUES ($1, 'x') RETURNING id", []any{42}, want{keys: []any{42}}},
+		{"INSERT ... ON CONFLICT DO NOTHING", "INSERT INTO profiles (id, name) VALUES ($1, 'x') ON CONFLICT DO NOTHING", []any{42}, want{keys: []any{42}}},
+		{"INSERT ... ON CONFLICT DO UPDATE of other columns", "INSERT INTO profiles (id, name) VALUES ($1, 'x') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name", []any{42}, want{keys: []any{42}}},
+		{"INSERT into a colocated table routes by its key column", "INSERT INTO addresses (id, profile_id, city) VALUES (1, $1, 'x')", []any{42}, want{keys: []any{42}}},
+		{"INSERT with a string key", "INSERT INTO events (tenant, n) VALUES ('acme', 1)", nil, want{keys: []any{"acme"}}},
+		{"INSERT with a uuid key", "INSERT INTO sessions (uid, n) VALUES ($1, 1)", []any{uuid}, want{keys: []any{uuid}}},
+		{"INSERT rows that all belong to one shard", "INSERT INTO profiles (id, name) VALUES ($1, 'a'), ($2, 'b')", []any{k.same1, k.same2},
+			want{keys: []any{k.same1}, strategy: plan.Single, rows: map[router.ShardID][]int{shardOf(k.same1): {0, 1}}}},
+		{"INSERT rows for different shards", "INSERT INTO profiles (id, name) VALUES ($1, 'a'), ($2, 'b'), ($3, 'c')", []any{k.k1, k.k2, k.k1},
+			want{keys: []any{k.k1, k.k2}, strategy: plan.Multi, rows: map[router.ShardID][]int{shardOf(k.k1): {0, 2}, shardOf(k.k2): {1}}}},
+		{"INSERT rows for every shard", "INSERT INTO profiles (id, name) VALUES ($1, 'a'), ($2, 'b'), ($3, 'c')", k.three, want{shards: shards, strategy: plan.All}},
+		{"INSERT without the key column", "INSERT INTO profiles (name) VALUES ('x')", nil, want{err: plan.ErrShardKeyRequired, errHas: "does not set its shard key column"}},
+		{"INSERT without column names", "INSERT INTO profiles VALUES (1, 'x')", nil, want{err: plan.ErrShardKeyRequired, errHas: "must name its columns"}},
+		{"INSERT with DEFAULT as the key", "INSERT INTO profiles (id, name) VALUES (DEFAULT, 'x')", nil, want{err: plan.ErrShardKeyRequired, errHas: "not a literal or a parameter"}},
+		{"INSERT with a function as the key", "INSERT INTO profiles (id, name) VALUES (nextval('s'), 'x')", nil, want{err: plan.ErrShardKeyRequired, errHas: "compute the key in your application"}},
+		{"INSERT with an expression as the key", "INSERT INTO profiles (id, name) VALUES (1 + 2, 'x')", nil, want{err: plan.ErrShardKeyRequired}},
+		{"INSERT with a NULL key", "INSERT INTO profiles (id, name) VALUES (NULL, 'x')", nil, want{err: plan.ErrShardKeyRequired}},
+		{"INSERT with one bad row", "INSERT INTO profiles (id, name) VALUES (1, 'a'), (now(), 'b')", nil, want{err: plan.ErrShardKeyRequired, errHas: "row 1"}},
+		{"INSERT with a row of the wrong width", "INSERT INTO profiles (id, name) VALUES (1, 'a'), (2)", nil, want{err: analyze.ErrUnsupportedQuery, errHas: "row 1"}},
+		{"INSERT with a key that is not a number", "INSERT INTO profiles (id, name) VALUES ('abc', 'x')", nil, want{errHas: "not an integer"}},
+		{"INSERT ... SELECT", "INSERT INTO profiles (id, name) SELECT id, name FROM archive", nil, want{err: analyze.ErrUnsupportedQuery, errHas: "INSERT ... SELECT"}},
+		{"INSERT ... DEFAULT VALUES", "INSERT INTO profiles DEFAULT VALUES", nil, want{err: analyze.ErrUnsupportedQuery}},
+		{"INSERT with a subquery value", "INSERT INTO profiles (id, name) VALUES (1, (SELECT 'x'))", nil, want{err: analyze.ErrUnsupportedQuery, errHas: "subquery inside VALUES"}},
+		{"INSERT with WITH", "WITH x AS (SELECT 1) INSERT INTO profiles (id) VALUES (1)", nil, want{err: analyze.ErrUnsupportedQuery, errHas: "WITH"}},
+		{"INSERT into an unknown table", "INSERT INTO mystery (id) VALUES (1)", nil, want{err: plan.ErrUnknownTable}},
+		{"INSERT with a missing argument", "INSERT INTO profiles (id, name) VALUES ($1, $2)", []any{1}, want{err: analyze.ErrMissingArgument}},
+		{"INSERT ... ON CONFLICT DO UPDATE of the shard key", "INSERT INTO profiles (id, name) VALUES ($1, 'x') ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id + 1", []any{42}, want{err: plan.ErrShardKeyImmutable}},
+
+		// ---- the shard key cannot be changed ------------------------------------
+		{"UPDATE sets the shard key", "UPDATE profiles SET id = 5 WHERE id = 1", nil, want{err: plan.ErrShardKeyImmutable, errHas: "delete it and insert it again"}},
+		{"UPDATE sets the shard key to itself", "UPDATE profiles SET id = id WHERE id = 1", nil, want{err: plan.ErrShardKeyImmutable}},
+		{"UPDATE sets several columns including the key", "UPDATE profiles SET (name, id) = ('a', 5) WHERE id = 1", nil, want{err: plan.ErrShardKeyImmutable}},
+		{"UPDATE sets the key of a colocated table", "UPDATE addresses SET profile_id = 5 WHERE profile_id = 1", nil, want{err: plan.ErrShardKeyImmutable}},
+		{"UPDATE of a column that merely looks like the key", "UPDATE addresses SET id = 5 WHERE profile_id = 1", nil, want{keys: []any{1}}},
+		{"UPDATE of a global table's id", "UPDATE countries SET id = 5 WHERE code = 'US'", nil, want{all: true}},
+		{"UPDATE that sets the key without a WHERE", "UPDATE profiles SET id = 5", nil, want{err: plan.ErrShardKeyImmutable}},
 		{"INSERT into global table", "INSERT INTO countries (code) VALUES ('US')", nil, want{all: true, strategy: plan.All}},
 		{"UPDATE global table", "UPDATE countries SET name = 'x' WHERE code = 'US'", nil, want{all: true}},
 		{"DELETE from global table", "DELETE FROM countries WHERE code = 'US'", nil, want{all: true}},
@@ -330,6 +372,9 @@ func TestRoutingSuite(t *testing.T) {
 			}
 			if fmt.Sprint(p.Targets) != fmt.Sprint(wantIDs) {
 				t.Errorf("targets = %v, want %v\nreason: %s", p.Targets, wantIDs, p.Reason)
+			}
+			if w.rows != nil && fmt.Sprint(p.Rows) != fmt.Sprint(w.rows) {
+				t.Errorf("rows = %v, want %v", p.Rows, w.rows)
 			}
 			if w.strategy != 0 && p.Strategy != w.strategy {
 				t.Errorf("strategy = %v, want %v", p.Strategy, w.strategy)

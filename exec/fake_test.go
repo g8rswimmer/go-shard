@@ -5,8 +5,21 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"io"
+	"sync"
 	"sync/atomic"
 )
+
+func (f *fakeShard) record(query string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, query)
+}
+
+func (f *fakeShard) queries() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.seen...)
+}
 
 // fakeShard is a database/sql driver whose behavior a test controls. It lets
 // the executor be tested with real *sql.DB / *sql.Rows semantics and no
@@ -17,6 +30,9 @@ type fakeShard struct {
 	query func(ctx context.Context) (rows int, err error)
 	exec  func(ctx context.Context) (affected int64, err error)
 	ping  func(ctx context.Context) error
+
+	mu   sync.Mutex
+	seen []string // SQL of every query and exec, in arrival order
 
 	inFlight, maxInFlight atomic.Int32
 	openRows              atomic.Int32
@@ -47,7 +63,8 @@ func (c *fakeConn) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (c *fakeConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *fakeConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.f.record(query)
 	n := c.f.inFlight.Add(1)
 	for {
 		m := c.f.maxInFlight.Load()
@@ -71,7 +88,8 @@ func (c *fakeConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedV
 	return &fakeRows{f: c.f, n: rows}, nil
 }
 
-func (c *fakeConn) ExecContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Result, error) {
+func (c *fakeConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.f.record(query)
 	if c.f.exec == nil {
 		return driver.RowsAffected(1), nil
 	}

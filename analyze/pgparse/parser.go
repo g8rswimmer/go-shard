@@ -98,6 +98,9 @@ func (w *walker) statement(n *pg.Node) error {
 			}
 		}
 		w.where(u.WhereClause, scope)
+		for _, t := range u.TargetList {
+			w.a.SetColumns = append(w.a.SetColumns, t.GetResTarget().GetName())
+		}
 		w.scanAll(scope, append(append([]*pg.Node{u.WhereClause}, u.TargetList...), u.ReturningList...)...)
 		return w.err
 
@@ -119,12 +122,15 @@ func (w *walker) statement(n *pg.Node) error {
 		return w.err
 
 	case *pg.Node_InsertStmt:
-		// Routing an INSERT from its VALUES is part of the writes milestone;
-		// here it is only described.
+		ins := s.InsertStmt
 		w.a.Op = analyze.OpInsert
+		if ins.WithClause != nil {
+			return unsupported("WITH (common table expressions)")
+		}
 		scope := w.newScope(-1)
-		w.a.Target = w.addTable(s.InsertStmt.Relation, scope)
-		return nil
+		w.a.Target = w.addTable(ins.Relation, scope)
+		w.insert(ins)
+		return w.err
 
 	default:
 		w.a.Op = analyze.OpOther
@@ -133,6 +139,113 @@ func (w *walker) statement(n *pg.Node) error {
 		return nil
 	}
 }
+
+// insert records the VALUES rows of an INSERT. For INSERT ... SELECT and
+// INSERT ... DEFAULT VALUES there are no rows to read, and Insert stays nil.
+func (w *walker) insert(ins *pg.InsertStmt) {
+	sel := ins.SelectStmt.GetSelectStmt()
+	if sel == nil || len(sel.ValuesLists) == 0 {
+		return
+	}
+
+	hasSubquery := false
+	walkNodes(ins.SelectStmt.ProtoReflect(), func(n *pg.Node) bool {
+		if n.GetSubLink() != nil {
+			hasSubquery = true
+		}
+		return !hasSubquery
+	})
+	if hasSubquery {
+		w.fail(unsupported("a subquery inside VALUES: compute the value first, or route with WithShardKey"))
+		return
+	}
+
+	info := &analyze.Insert{}
+	for _, c := range ins.Cols {
+		info.Columns = append(info.Columns, c.GetResTarget().GetName())
+	}
+	for _, vl := range sel.ValuesLists {
+		var row []analyze.Cell
+		for _, item := range vl.GetList().GetItems() {
+			v, ok, err := w.constant(unwrapCast(item))
+			if err != nil {
+				w.fail(err)
+				return
+			}
+			row = append(row, analyze.Cell{Value: v, Known: ok})
+		}
+		info.Rows = append(info.Rows, row)
+	}
+	if oc := ins.OnConflictClause; oc != nil && oc.Action == pg.OnConflictAction_ONCONFLICT_UPDATE {
+		for _, t := range oc.TargetList {
+			info.ConflictSet = append(info.ConflictSet, t.GetResTarget().GetName())
+		}
+	}
+	w.a.Insert = info
+}
+
+// SplitRows returns the INSERT with only the given VALUES rows, in the order
+// given, and the arguments it still uses. Parameters are renumbered from $1
+// with no gaps, in the order the statement uses them, so the result is the
+// same every time it is asked for.
+func (Parser) SplitRows(sql string, args []any, rows []int) (string, []any, error) {
+	res, err := pg.Parse(sql)
+	if err != nil {
+		return "", nil, fmt.Errorf("shard: cannot parse SQL: %w", err)
+	}
+	if len(res.Stmts) != 1 {
+		return "", nil, unsupported("cannot split %d statements", len(res.Stmts))
+	}
+	sel := res.Stmts[0].Stmt.GetInsertStmt().GetSelectStmt().GetSelectStmt()
+	if sel == nil || len(sel.ValuesLists) == 0 {
+		return "", nil, unsupported("only INSERT ... VALUES can be split across shards")
+	}
+	if len(rows) == 0 {
+		return "", nil, unsupported("no rows to keep")
+	}
+
+	kept := make([]*pg.Node, len(rows))
+	for i, r := range rows {
+		if r < 0 || r >= len(sel.ValuesLists) {
+			return "", nil, fmt.Errorf("shard: row %d is out of range (the statement has %d rows)", r, len(sel.ValuesLists))
+		}
+		kept[i] = sel.ValuesLists[r]
+	}
+	sel.ValuesLists = kept
+
+	renumber := map[int32]int32{}
+	var newArgs []any
+	var walkErr error
+	walkNodes(res.Stmts[0].Stmt.ProtoReflect(), func(n *pg.Node) bool {
+		p := n.GetParamRef()
+		if p == nil || walkErr != nil {
+			return walkErr == nil
+		}
+		to, seen := renumber[p.Number]
+		if !seen {
+			if p.Number < 1 || int(p.Number) > len(args) {
+				walkErr = fmt.Errorf("%w: the SQL uses $%d but %d argument(s) were given", analyze.ErrMissingArgument, p.Number, len(args))
+				return false
+			}
+			newArgs = append(newArgs, args[p.Number-1])
+			to = int32(len(newArgs))
+			renumber[p.Number] = to
+		}
+		p.Number = to
+		return true
+	})
+	if walkErr != nil {
+		return "", nil, walkErr
+	}
+
+	out, err := pg.Deparse(res)
+	if err != nil {
+		return "", nil, fmt.Errorf("shard: cannot rebuild the INSERT: %w", err)
+	}
+	return out, newArgs, nil
+}
+
+var _ analyze.RowSplitter = Parser{}
 
 // selectStmt records the tables and predicates of a SELECT (the statement
 // itself or a subquery) at the given scope.
@@ -488,26 +601,31 @@ func (w *walker) scanAll(scope int, nodes ...*pg.Node) {
 	}
 }
 
-// walkNodes calls fn for every pg.Node inside m, depth first. If fn returns
-// false the node's children are skipped.
+// walkNodes calls fn for every pg.Node inside m, depth first, fields in
+// declaration order. If fn returns false the node's children are skipped. The
+// order is fixed, not left to protobuf's Range, because callers number things
+// in visiting order and that must be the same on every run.
 func walkNodes(m protoreflect.Message, fn func(*pg.Node) bool) {
 	if node, ok := m.Interface().(*pg.Node); ok && !fn(node) {
 		return
 	}
-	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		switch {
-		case fd.IsList() && fd.Message() != nil:
-			l := v.List()
-			for i := 0; i < l.Len(); i++ {
-				walkNodes(l.Get(i).Message(), fn)
-			}
-		case fd.Message() != nil && !fd.IsMap():
-			walkNodes(v.Message(), fn)
-		default:
-			// scalar field: nothing to walk
+	fields := m.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		if fd.Message() == nil || fd.IsMap() || !m.Has(fd) {
+			continue
 		}
-		return true
-	})
+		v := m.Get(fd)
+		switch {
+		case fd.IsList():
+			l := v.List()
+			for j := 0; j < l.Len(); j++ {
+				walkNodes(l.Get(j).Message(), fn)
+			}
+		default:
+			walkNodes(v.Message(), fn)
+		}
+	}
 }
 
 // selectExtras records what merging results across shards will need.

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/g8rswimmer/go-shard/analyze"
+	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/plan"
 )
 
@@ -24,6 +26,14 @@ type ShardOutcome struct {
 	RowsAffected int64
 	// Err is nil when the write succeeded on this shard.
 	Err error
+	// Rows lists which VALUES rows of an INSERT this shard received, as indexes
+	// into the statement's rows. It is nil for other statements. After a
+	// partial failure it tells you which rows to retry.
+	Rows []int
+	// Replayed is true when an idempotency key showed that the write had
+	// already been applied on this shard, so it was not repeated.
+	// RowsAffected is then what the first attempt reported.
+	Replayed bool
 }
 
 // WriteResult reports a write shard by shard. A write that reached several
@@ -44,12 +54,45 @@ func (r WriteResult) RowsAffected() int64 {
 	return n
 }
 
+// Failed returns the error from each shard where the write failed.
+func (r WriteResult) Failed() map[ShardID]error {
+	var out map[ShardID]error
+	for id, o := range r.PerShard {
+		if o.Err != nil {
+			if out == nil {
+				out = map[ShardID]error{}
+			}
+			out[id] = o.Err
+		}
+	}
+	return out
+}
+
+// FailedRows returns, sorted, the INSERT rows that went to shards where the
+// write failed: the rows to send again. Rows that were applied are not listed.
+func (r WriteResult) FailedRows() []int {
+	var rows []int
+	for _, o := range r.PerShard {
+		if o.Err != nil {
+			rows = append(rows, o.Rows...)
+		}
+	}
+	sort.Ints(rows)
+	return rows
+}
+
 // Statement is a statement that already knows how it routes. Build one with
 // package query.
 type Statement interface {
 	SQL() string
 	Args() []any
 	Analysis() analyze.Analysis
+}
+
+// rowSplitter is implemented by statements that can restrict an INSERT to some
+// of its rows (package query's do).
+type rowSplitter interface {
+	SplitRows(rows []int) (string, []any, error)
 }
 
 // Querier runs statements. *DB and the values returned by WithShardKey,
@@ -64,6 +107,8 @@ type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (Rows, error)
 	// Exec runs a write on the target shard(s). It returns an error if the
 	// write failed on any shard; the WriteResult still reports every shard.
+	// An INSERT with several rows is split so each shard receives only its own
+	// rows. See WithIdempotencyKey to make a retry safe.
 	Exec(ctx context.Context, sql string, args ...any) (WriteResult, error)
 	// QueryStatement is Query for a built Statement; it needs no SQL parsing.
 	QueryStatement(ctx context.Context, st Statement) (Rows, error)
@@ -103,6 +148,16 @@ func (db *DB) WithShard(id ShardID) Querier { return &scoped{db, route{kind: rou
 // result merging and returns ErrUnsupportedQuery until that is added.
 func (db *DB) WithAllShards() Querier { return &scoped{db, route{kind: routeAll}} }
 
+// request is one statement to run.
+type request struct {
+	sql      string
+	args     []any
+	analysis analysis
+	// split restricts an INSERT to some of its VALUES rows. It is nil when the
+	// statement cannot be split.
+	split func(rows []int) (string, []any, error)
+}
+
 // Query implements Querier.
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	return (&scoped{db: db}).Query(ctx, sql, args...)
@@ -124,21 +179,51 @@ func (db *DB) ExecStatement(ctx context.Context, st Statement) (WriteResult, err
 }
 
 func (s *scoped) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
-	return s.query(ctx, sql, args, s.analyzeSQL(sql, args))
+	return s.query(ctx, s.sqlRequest(sql, args))
 }
 
 func (s *scoped) QueryStatement(ctx context.Context, st Statement) (Rows, error) {
-	return s.query(ctx, st.SQL(), st.Args(), func() (analyze.Analysis, error) { return st.Analysis(), nil })
+	return s.query(ctx, statementRequest(st))
 }
 
-func (s *scoped) query(ctx context.Context, sql string, args []any, a analysis) (Rows, error) {
-	p, err := s.plan(sql, args, a)
+func (s *scoped) Exec(ctx context.Context, sql string, args ...any) (WriteResult, error) {
+	return s.exec(ctx, s.sqlRequest(sql, args))
+}
+
+func (s *scoped) ExecStatement(ctx context.Context, st Statement) (WriteResult, error) {
+	return s.exec(ctx, statementRequest(st))
+}
+
+// sqlRequest wraps raw SQL: it is analyzed, and split, by the DB's analyzer.
+func (s *scoped) sqlRequest(sql string, args []any) request {
+	r := request{sql: sql, args: args, analysis: s.analyzeSQL(sql, args)}
+	if sp, ok := s.db.analyzer.(analyze.RowSplitter); ok {
+		r.split = func(rows []int) (string, []any, error) { return sp.SplitRows(sql, args, rows) }
+	}
+	return r
+}
+
+// statementRequest wraps a built statement, which brings its own analysis.
+func statementRequest(st Statement) request {
+	r := request{
+		sql:      st.SQL(),
+		args:     st.Args(),
+		analysis: func() (analyze.Analysis, error) { return st.Analysis(), nil },
+	}
+	if sp, ok := st.(rowSplitter); ok {
+		r.split = sp.SplitRows
+	}
+	return r
+}
+
+func (s *scoped) query(ctx context.Context, r request) (Rows, error) {
+	p, err := s.plan(r)
 	if err != nil {
 		return nil, err
 	}
 	if len(p.Targets) > 1 {
-		return nil, fmt.Errorf("%w: reading from %d shards needs result merging, which is not available yet; "+
-			"narrow the query to one shard key, or use WithShardKey / WithShard", ErrUnsupportedQuery, len(p.Targets))
+		return nil, fmt.Errorf("%w: running a statement on %d shards through Query needs result merging, which is not available yet; "+
+			"narrow it to one shard key, use WithShardKey / WithShard, or use Exec if you do not need rows back", ErrUnsupportedQuery, len(p.Targets))
 	}
 	res, err := s.db.exec.Query(ctx, p)
 	if err != nil {
@@ -147,20 +232,22 @@ func (s *scoped) query(ctx context.Context, sql string, args []any, a analysis) 
 	return res[0].Rows, nil
 }
 
-func (s *scoped) Exec(ctx context.Context, sql string, args ...any) (WriteResult, error) {
-	return s.exec(ctx, sql, args, s.analyzeSQL(sql, args))
-}
-
-func (s *scoped) ExecStatement(ctx context.Context, st Statement) (WriteResult, error) {
-	return s.exec(ctx, st.SQL(), st.Args(), func() (analyze.Analysis, error) { return st.Analysis(), nil })
-}
-
-func (s *scoped) exec(ctx context.Context, sql string, args []any, a analysis) (WriteResult, error) {
-	p, err := s.plan(sql, args, a)
+func (s *scoped) exec(ctx context.Context, r request) (WriteResult, error) {
+	p, err := s.plan(r)
 	if err != nil {
 		return WriteResult{}, err
 	}
-	outcomes, err := s.db.exec.Exec(ctx, p)
+
+	var outcomes []exec.ShardExec
+	key, hasKey := IdempotencyKey(ctx)
+	switch {
+	case hasKey && key == "":
+		return WriteResult{}, errors.New("shard: the idempotency key is empty")
+	case hasKey:
+		outcomes, err = s.db.exec.ExecIdempotent(ctx, p, exec.Idempotency{Key: key, Table: s.db.idemTable})
+	default:
+		outcomes, err = s.db.exec.Exec(ctx, p)
+	}
 	if err != nil {
 		return WriteResult{}, err
 	}
@@ -168,14 +255,12 @@ func (s *scoped) exec(ctx context.Context, sql string, args []any, a analysis) (
 	res := WriteResult{PerShard: make(map[ShardID]ShardOutcome, len(outcomes))}
 	var failed []error
 	for _, o := range outcomes {
-		switch {
-		case o.Err != nil:
-			res.PerShard[o.Shard] = ShardOutcome{Err: &ShardError{Shard: o.Shard, Err: o.Err}}
-			failed = append(failed, res.PerShard[o.Shard].Err)
-		default:
-			n, _ := o.Result.RowsAffected()
-			res.PerShard[o.Shard] = ShardOutcome{RowsAffected: n}
+		out := ShardOutcome{RowsAffected: o.RowsAffected, Rows: o.Rows, Replayed: o.Replayed}
+		if o.Err != nil {
+			out = ShardOutcome{Rows: o.Rows, Err: &ShardError{Shard: o.Shard, Err: o.Err}}
+			failed = append(failed, out.Err)
 		}
+		res.PerShard[o.Shard] = out
 	}
 	switch len(failed) {
 	case 0:
@@ -206,8 +291,8 @@ func (s *scoped) analyzeSQL(sql string, args []any) analysis {
 
 // plan turns the routing decision into a Plan. A caller-supplied route wins;
 // otherwise the statement is analyzed and routed from its own conditions.
-func (s *scoped) plan(sql string, args []any, a analysis) (plan.Plan, error) {
-	p := plan.Plan{SQL: sql, Args: args}
+func (s *scoped) plan(r request) (plan.Plan, error) {
+	p := plan.Plan{SQL: r.sql, Args: r.args}
 	switch s.route.kind {
 	case routeByKey:
 		bucket, err := s.db.router.Bucket(s.route.key)
@@ -233,7 +318,7 @@ func (s *scoped) plan(sql string, args []any, a analysis) (plan.Plan, error) {
 		p.Strategy = plan.All
 		p.Reason = "WithAllShards()"
 	default:
-		an, err := a()
+		an, err := r.analysis()
 		if err != nil {
 			return plan.Plan{}, err
 		}
@@ -241,7 +326,31 @@ func (s *scoped) plan(sql string, args []any, a analysis) (plan.Plan, error) {
 		if err != nil {
 			return plan.Plan{}, err
 		}
-		p.Targets, p.Strategy, p.Reason = routed.Targets, routed.Strategy, routed.Reason
+		p.Targets, p.Strategy, p.Reason, p.Rows = routed.Targets, routed.Strategy, routed.Reason, routed.Rows
+		if err := splitInsert(&p, r); err != nil {
+			return plan.Plan{}, err
+		}
 	}
 	return p, nil
+}
+
+// splitInsert gives each shard of a multi-shard INSERT a statement holding only
+// its own rows.
+func splitInsert(p *plan.Plan, r request) error {
+	if len(p.Targets) < 2 || len(p.Rows) < 2 {
+		return nil
+	}
+	if r.split == nil {
+		return fmt.Errorf("%w: the rows of this INSERT belong to %d different shards and this statement cannot be split; "+
+			"insert the rows in separate calls, or use package query, whose INSERT can be split", ErrUnsupportedQuery, len(p.Targets))
+	}
+	p.PerShard = make(map[ShardID]plan.ShardStatement, len(p.Targets))
+	for _, id := range p.Targets {
+		sql, args, err := r.split(p.Rows[id])
+		if err != nil {
+			return fmt.Errorf("splitting the INSERT for %s: %w", id, err)
+		}
+		p.PerShard[id] = plan.ShardStatement{SQL: sql, Args: args}
+	}
+	return nil
 }

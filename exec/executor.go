@@ -65,9 +65,16 @@ type ShardRows struct {
 
 // ShardExec is the outcome of a statement on one shard.
 type ShardExec struct {
-	Shard  router.ShardID
-	Result sql.Result // nil when Err is set
-	Err    error
+	Shard router.ShardID
+	// RowsAffected is zero when Err is set.
+	RowsAffected int64
+	// Replayed is true when an idempotency key showed the write had already
+	// been applied on this shard, so it was not repeated. RowsAffected is then
+	// what the first attempt reported.
+	Replayed bool
+	// Rows are the indexes of the INSERT's VALUES rows this shard received.
+	Rows []int
+	Err  error
 }
 
 // Query runs the plan's SQL on every target in parallel, at most MaxFanout at
@@ -102,7 +109,8 @@ func (e *Executor) Query(ctx context.Context, p plan.Plan) ([]ShardRows, error) 
 			// is removed once the query returns, so failCtx being cancelled when
 			// Query exits does not cut off rows the caller is still reading.
 			stop := context.AfterFunc(failCtx, cancel)
-			rows, err := conns[i].QueryContext(sctx, p.SQL, p.Args...)
+			query, args := p.StatementFor(id)
+			rows, err := conns[i].QueryContext(sctx, query, args...)
 			stop()
 			if err != nil {
 				cancel()
@@ -132,6 +140,10 @@ func (e *Executor) Query(ctx context.Context, p plan.Plan) ([]ShardRows, error) 
 // outcome reported, because writes that succeeded on some shards must be
 // visible to the caller. Outcomes are in the order of p.Targets.
 func (e *Executor) Exec(ctx context.Context, p plan.Plan) ([]ShardExec, error) {
+	return e.exec(ctx, p, nil)
+}
+
+func (e *Executor) exec(ctx context.Context, p plan.Plan, idem *Idempotency) ([]ShardExec, error) {
 	conns, err := e.conns(p.Targets)
 	if err != nil {
 		return nil, err
@@ -144,8 +156,19 @@ func (e *Executor) Exec(ctx context.Context, p plan.Plan) ([]ShardExec, error) {
 		g.Go(func() error {
 			sctx, cancel := e.shardContext(ctx)
 			defer cancel()
-			res, err := conns[i].ExecContext(sctx, p.SQL, p.Args...)
-			out[i] = ShardExec{Shard: id, Result: res, Err: err}
+			query, args := p.StatementFor(id)
+			o := ShardExec{Shard: id, Rows: p.Rows[id]}
+			switch {
+			case idem != nil:
+				o.RowsAffected, o.Replayed, o.Err = runIdempotent(sctx, conns[i], id, query, args, *idem)
+			default:
+				res, err := conns[i].ExecContext(sctx, query, args...)
+				o.Err = err
+				if err == nil {
+					o.RowsAffected, _ = res.RowsAffected()
+				}
+			}
+			out[i] = o
 			return nil
 		})
 	}

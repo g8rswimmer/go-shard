@@ -105,18 +105,73 @@ func TestRouteRefusesNonStatements(t *testing.T) {
 	}
 }
 
-func TestRouteInsertNeedsAKey(t *testing.T) {
+func TestRouteInsert(t *testing.T) {
+	reg, r := testSetup(t)
+	insert := func(table string, in *analyze.Insert) analyze.Analysis {
+		return analyze.Analysis{
+			Op: analyze.OpInsert, Scopes: []int{-1}, Target: 0, Insert: in,
+			Tables: []analyze.TableRef{{ID: 0, Name: table}},
+		}
+	}
+
+	// An INSERT whose rows are not known cannot be routed.
+	if _, err := Route(insert("profiles", nil), reg, r, Options{}); !errors.Is(err, analyze.ErrUnsupportedQuery) {
+		t.Errorf("INSERT without rows: error = %v, want ErrUnsupportedQuery", err)
+	}
+
+	// Rows are grouped by the shard that owns each key.
+	in := &analyze.Insert{
+		Columns: []string{"name", "id"},
+		Rows: [][]analyze.Cell{
+			{{Value: "a", Known: true}, {Value: 1, Known: true}},
+			{{Value: "b", Known: true}, {Value: 2, Known: true}},
+			{{Value: "c", Known: true}, {Value: 1, Known: true}},
+		},
+	}
+	p, err := Route(insert("profiles", in), reg, r, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner1, _ := r.ShardFor(1)
+	if got := p.Rows[owner1]; len(got) < 2 || got[0] != 0 || got[len(got)-1] != 2 {
+		t.Errorf("rows for the owner of key 1 = %v, want rows 0 and 2 in order", got)
+	}
+	total := 0
+	for _, rows := range p.Rows {
+		total += len(rows)
+	}
+	if total != 3 {
+		t.Errorf("rows assigned = %d, want every row assigned exactly once", total)
+	}
+
+	// A global table takes every INSERT on every shard.
+	if p, err := Route(insert("countries", in), reg, r, Options{}); err != nil || p.Strategy != All {
+		t.Errorf("INSERT into a global table: %+v, %v", p, err)
+	}
+}
+
+func TestRouteConflictCannotChangeTheKey(t *testing.T) {
 	reg, r := testSetup(t)
 	a := analyze.Analysis{
-		Op: analyze.OpInsert, Scopes: []int{-1}, Target: 0,
+		Op: analyze.OpInsert, Scopes: []int{-1},
 		Tables: []analyze.TableRef{{ID: 0, Name: "profiles"}},
+		Insert: &analyze.Insert{
+			Columns: []string{"id"}, Rows: [][]analyze.Cell{{{Value: 1, Known: true}}},
+			ConflictSet: []string{"id"},
+		},
 	}
-	if _, err := Route(a, reg, r, Options{}); !errors.Is(err, ErrShardKeyRequired) {
-		t.Errorf("error = %v, want ErrShardKeyRequired", err)
+	if _, err := Route(a, reg, r, Options{}); !errors.Is(err, ErrShardKeyImmutable) {
+		t.Errorf("error = %v, want ErrShardKeyImmutable", err)
 	}
-	a.Tables[0].Name = "countries"
-	if p, err := Route(a, reg, r, Options{}); err != nil || p.Strategy != All {
-		t.Errorf("INSERT into a global table: %+v, %v", p, err)
+}
+
+func TestStatementFor(t *testing.T) {
+	p := Plan{SQL: "all", Args: []any{1}, PerShard: map[router.ShardID]ShardStatement{"b": {SQL: "just b", Args: []any{2}}}}
+	if sql, args := p.StatementFor("a"); sql != "all" || len(args) != 1 || args[0] != 1 {
+		t.Errorf("shard a: %q %v, want the plan's statement", sql, args)
+	}
+	if sql, args := p.StatementFor("b"); sql != "just b" || len(args) != 1 || args[0] != 2 {
+		t.Errorf("shard b: %q %v, want its own statement", sql, args)
 	}
 }
 

@@ -281,3 +281,146 @@ func TestParserIsSafeForConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+func TestInsertFacts(t *testing.T) {
+	a := analyzeSQL(t, `INSERT INTO profiles (id, name, note) VALUES ($1, 'a', DEFAULT), (7::bigint, $2, now())
+		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, note = $3 RETURNING id`, 42, "n", "x")
+
+	if a.Op != analyze.OpInsert || a.Tables[a.Target].Name != "profiles" || a.Insert == nil {
+		t.Fatalf("analysis = %+v", a)
+	}
+	in := a.Insert
+	if !reflect.DeepEqual(in.Columns, []string{"id", "name", "note"}) {
+		t.Errorf("columns = %v", in.Columns)
+	}
+	want := [][]analyze.Cell{
+		{{Value: 42, Known: true}, {Value: "a", Known: true}, {Known: false}},
+		{{Value: int64(7), Known: true}, {Value: "n", Known: true}, {Known: false}},
+	}
+	if !reflect.DeepEqual(in.Rows, want) {
+		t.Errorf("rows = %+v\nwant   %+v", in.Rows, want)
+	}
+	if !reflect.DeepEqual(in.ConflictSet, []string{"name", "note"}) {
+		t.Errorf("conflict set = %v", in.ConflictSet)
+	}
+}
+
+func TestInsertFormsWithoutKnownRows(t *testing.T) {
+	for _, sql := range []string{
+		"INSERT INTO t (a) SELECT a FROM u",
+		"INSERT INTO t DEFAULT VALUES",
+	} {
+		if a := analyzeSQL(t, sql); a.Op != analyze.OpInsert || a.Insert != nil {
+			t.Errorf("%s: want an INSERT with no rows known, got %+v", sql, a.Insert)
+		}
+	}
+	if a := analyzeSQL(t, "INSERT INTO t VALUES (1, 2)"); a.Insert == nil || len(a.Insert.Columns) != 0 || len(a.Insert.Rows) != 1 {
+		t.Errorf("an INSERT without a column list: %+v", a.Insert)
+	}
+	if a := analyzeSQL(t, "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"); len(a.Insert.ConflictSet) != 0 {
+		t.Errorf("DO NOTHING assigns nothing: %v", a.Insert.ConflictSet)
+	}
+}
+
+func TestInsertErrors(t *testing.T) {
+	for sql, has := range map[string]string{
+		"INSERT INTO t (a) VALUES ((SELECT 1))":             "subquery inside VALUES",
+		"WITH x AS (SELECT 1) INSERT INTO t (a) VALUES (1)": "WITH",
+	} {
+		if _, err := New().FromSQL(sql, nil); !errors.Is(err, analyze.ErrUnsupportedQuery) || !strings.Contains(err.Error(), has) {
+			t.Errorf("%s: error = %v, want ErrUnsupportedQuery mentioning %q", sql, err, has)
+		}
+	}
+	if _, err := New().FromSQL("INSERT INTO t (a) VALUES ($1)", nil); !errors.Is(err, analyze.ErrMissingArgument) {
+		t.Errorf("error = %v, want ErrMissingArgument", err)
+	}
+}
+
+func TestUpdateSetColumns(t *testing.T) {
+	a := analyzeSQL(t, "UPDATE t SET a = 1, b = $1, (c, d) = (1, 2) WHERE id = 5", 9)
+	if !reflect.DeepEqual(a.SetColumns, []string{"a", "b", "c", "d"}) {
+		t.Errorf("set columns = %v", a.SetColumns)
+	}
+	if a := analyzeSQL(t, "DELETE FROM t WHERE id = 5"); len(a.SetColumns) != 0 {
+		t.Errorf("DELETE sets nothing: %v", a.SetColumns)
+	}
+}
+
+func TestSplitRows(t *testing.T) {
+	const sql = `INSERT INTO profiles (id, name, note) VALUES ($1, $2, 'a'), ($3, $4, DEFAULT), (7, $2, now())
+		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, note = $5 RETURNING id`
+	args := []any{"id0", "name0", "id1", "name1", "note"}
+	p := New()
+
+	t.Run("keeps the rows asked for, in order", func(t *testing.T) {
+		got, gotArgs, err := p.SplitRows(sql, args, []int{2, 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Parameters are renumbered from $1 in the order the statement uses
+		// them; rows 2 and 0 share name0 so it appears once.
+		if want := []any{"name0", "id0", "note"}; !reflect.DeepEqual(gotArgs, want) {
+			t.Errorf("args = %v, want %v", gotArgs, want)
+		}
+		for _, w := range []string{"VALUES (7, $1, now()), ($2, $1, 'a')", "note = $3", "RETURNING id"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("SQL does not contain %q:\n%s", w, got)
+			}
+		}
+		if strings.Contains(got, "DEFAULT") || strings.Contains(got, "$4") {
+			t.Errorf("row 1 should be gone, with no gaps in the parameters:\n%s", got)
+		}
+	})
+
+	t.Run("the result reads back as the same rows", func(t *testing.T) {
+		got, gotArgs, err := p.SplitRows(sql, args, []int{1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := analyzeSQL(t, got, gotArgs...)
+		if a.Insert == nil || len(a.Insert.Rows) != 1 || a.Insert.Rows[0][0].Value != "id1" || a.Insert.Rows[0][1].Value != "name1" {
+			t.Errorf("split statement analyzes as %+v", a.Insert)
+		}
+	})
+
+	t.Run("is deterministic", func(t *testing.T) {
+		first, firstArgs, _ := p.SplitRows(sql, args, []int{0, 2})
+		for i := 0; i < 50; i++ {
+			again, againArgs, err := p.SplitRows(sql, args, []int{0, 2})
+			if err != nil || again != first || !reflect.DeepEqual(againArgs, firstArgs) {
+				t.Fatalf("run %d differs:\n%s\n%s", i, first, again)
+			}
+		}
+	})
+
+	t.Run("keeping every row changes nothing but formatting", func(t *testing.T) {
+		got, gotArgs, err := p.SplitRows("INSERT INTO t (a) VALUES ($1), ($2)", []any{1, 2}, []int{0, 1})
+		if err != nil || got != "INSERT INTO t (a) VALUES ($1), ($2)" || !reflect.DeepEqual(gotArgs, []any{1, 2}) {
+			t.Errorf("got %q %v %v", got, gotArgs, err)
+		}
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			sql  string
+			args []any
+			rows []int
+			is   error
+			has  string
+		}{
+			"row out of range":  {sql, args, []int{3}, nil, "row 3 is out of range"},
+			"negative row":      {sql, args, []int{-1}, nil, "out of range"},
+			"no rows":           {sql, args, nil, analyze.ErrUnsupportedQuery, "no rows"},
+			"not an INSERT":     {"SELECT 1", nil, []int{0}, analyze.ErrUnsupportedQuery, "INSERT ... VALUES"},
+			"INSERT ... SELECT": {"INSERT INTO t (a) SELECT 1", nil, []int{0}, analyze.ErrUnsupportedQuery, "INSERT ... VALUES"},
+			"two statements":    {"SELECT 1; SELECT 2", nil, []int{0}, analyze.ErrUnsupportedQuery, "2 statements"},
+			"missing argument":  {"INSERT INTO t (a) VALUES ($2)", []any{1}, []int{0}, analyze.ErrMissingArgument, "$2"},
+			"syntax error":      {"INSERT INTO", nil, []int{0}, nil, "cannot parse SQL"},
+		} {
+			_, _, err := p.SplitRows(tc.sql, tc.args, tc.rows)
+			if err == nil || !strings.Contains(err.Error(), tc.has) || (tc.is != nil && !errors.Is(err, tc.is)) {
+				t.Errorf("%s: error = %v, want %v mentioning %q", name, err, tc.is, tc.has)
+			}
+		}
+	})
+}
