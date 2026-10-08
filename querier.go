@@ -8,6 +8,7 @@ import (
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
+	"github.com/g8rswimmer/go-shard/merge"
 	"github.com/g8rswimmer/go-shard/plan"
 )
 
@@ -89,6 +90,12 @@ type Statement interface {
 	Analysis() analyze.Analysis
 }
 
+// statementMerger is implemented by statements that can rewrite themselves for
+// several shards (package query's SELECT does).
+type statementMerger interface {
+	MergePlan() (merge.Plan, error)
+}
+
 // rowSplitter is implemented by statements that can restrict an INSERT to some
 // of its rows (package query's do).
 type rowSplitter interface {
@@ -144,8 +151,9 @@ func (db *DB) WithShardKey(key any) Querier { return &scoped{db, route{kind: rou
 // WithShard routes statements to one named shard.
 func (db *DB) WithShard(id ShardID) Querier { return &scoped{db, route{kind: routeByShard, shard: id}} }
 
-// WithAllShards runs statements on every shard. Exec works today; Query needs
-// result merging and returns ErrUnsupportedQuery until that is added.
+// WithAllShards runs statements on every shard. A query's rows are merged:
+// ORDER BY, LIMIT, OFFSET, DISTINCT, aggregates and GROUP BY give the answer
+// one database would; see the package documentation for what is supported.
 func (db *DB) WithAllShards() Querier { return &scoped{db, route{kind: routeAll}} }
 
 // request is one statement to run.
@@ -156,6 +164,9 @@ type request struct {
 	// split restricts an INSERT to some of its VALUES rows. It is nil when the
 	// statement cannot be split.
 	split func(rows []int) (string, []any, error)
+	// merge rewrites a SELECT for several shards. It is nil when the statement
+	// cannot be.
+	merge func() (merge.Plan, error)
 }
 
 // Query implements Querier.
@@ -200,6 +211,9 @@ func (s *scoped) sqlRequest(sql string, args []any) request {
 	if sp, ok := s.db.analyzer.(analyze.RowSplitter); ok {
 		r.split = func(rows []int) (string, []any, error) { return sp.SplitRows(sql, args, rows) }
 	}
+	if mp, ok := s.db.analyzer.(merge.Planner); ok {
+		r.merge = func() (merge.Plan, error) { return mp.PlanMerge(sql, args) }
+	}
 	return r
 }
 
@@ -213,6 +227,9 @@ func statementRequest(st Statement) request {
 	if sp, ok := st.(rowSplitter); ok {
 		r.split = sp.SplitRows
 	}
+	if mp, ok := st.(statementMerger); ok {
+		r.merge = mp.MergePlan
+	}
 	return r
 }
 
@@ -222,8 +239,7 @@ func (s *scoped) query(ctx context.Context, r request) (Rows, error) {
 		return nil, err
 	}
 	if len(p.Targets) > 1 {
-		return nil, fmt.Errorf("%w: running a statement on %d shards through Query needs result merging, which is not available yet; "+
-			"narrow it to one shard key, use WithShardKey / WithShard, or use Exec if you do not need rows back", ErrUnsupportedQuery, len(p.Targets))
+		return s.fanOut(ctx, r, p)
 	}
 	res, err := s.db.exec.Query(ctx, p)
 	if err != nil {

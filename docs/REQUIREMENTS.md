@@ -65,11 +65,13 @@ registry.Global("countries")
 
 ### FR-5 Fan-out reads and result merging
 - Execute on selected shards in parallel with context cancellation and timeouts.
-- Merge results: ordered merge for `ORDER BY`, global `LIMIT`/`OFFSET`, `DISTINCT`, and aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG` via sum + count).
-- Supported and unsupported constructs are defined explicitly. Cross-shard joins, window functions and subqueries are rejected with a clear error.
+- Merge results: ordered merge for `ORDER BY`, global `LIMIT`/`OFFSET`, `DISTINCT`, and aggregates (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG` via sum + count), with `GROUP BY` and `HAVING`.
+- Rows are streamed: an ordered merge holds one row per shard however large the result. What must be remembered (groups, distinct rows) is bounded by a configurable limit and fails rather than exhausting memory.
+- Supported and unsupported constructs are defined explicitly (ARCHITECTURE 5.5). Cross-shard joins, window functions and subqueries are rejected with a clear error.
 - The error for a rejected cross-shard join names the alternatives: colocation, global tables, or two queries joined in application code.
-- The merge layer sits behind an interface so a join-capable implementation can be added later without changing callers.
-- Partial-failure policy for fan-out reads: fail-fast by default, with an optional allow-partial mode that reports per-shard errors.
+- The merge layer takes a plain description of how to combine the shards' rows (a spec) rather than SQL, so a join-capable implementation can be added later without changing callers.
+- Partial-failure policy for fan-out reads: fail-fast by default, with an optional allow-partial mode (`shard.AllowPartial(ctx)`) that merges the shards that answered and reports the others per shard (`shard.ShardErrors`).
+- Known differences from a single database are documented: text is ordered bytewise (as the `C` collation), and a floating-point sum may differ in its last digits.
 
 ### FR-6 Colocation
 - Rows of colocated tables share the parent's shard key and therefore its shard.

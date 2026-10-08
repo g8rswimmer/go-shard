@@ -84,6 +84,7 @@ func TestConfigValidateRejects(t *testing.T) {
 		{"no dsn", Config{Shards: []ShardConfig{{ID: "a"}}, Registry: reg}, `shard "a" has no DSN`},
 		{"negative conns", Config{Shards: []ShardConfig{{ID: "a", DSN: "x", MaxConns: -1}}, Registry: reg}, "MaxConns cannot be negative"},
 		{"negative fanout", Config{Shards: shards("a"), Registry: reg, MaxFanout: -1}, "MaxFanout cannot be negative"},
+		{"negative merge limit", Config{Shards: shards("a"), Registry: reg, MaxMergeRows: -1}, "MaxMergeRows cannot be negative"},
 		{"negative timeout", Config{Shards: shards("a"), Registry: reg, ShardTimeout: -time.Second}, "ShardTimeout cannot be negative"},
 		{"buckets on some shards", Config{Shards: partial, Registry: reg}, "1 of 2 shards list Buckets"},
 		{"bucket gap", Config{Shards: gap, Registry: reg}, "buckets 11-1023 are not assigned"},

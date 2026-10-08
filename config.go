@@ -18,7 +18,10 @@ type ShardID = router.ShardID
 // Range returns the inclusive bucket range [from, to] for ShardConfig.Buckets.
 func Range(from, to int) router.BucketRange { return router.Buckets(from, to) }
 
-const defaultMaxConns = 10
+const (
+	defaultMaxConns     = 10
+	defaultMaxMergeRows = 100_000
+)
 
 // ShardConfig describes one shard.
 type ShardConfig struct {
@@ -46,6 +49,12 @@ type Config struct {
 	// ShardTimeout limits each shard's work, including streaming its rows.
 	// Zero means no limit beyond the caller's context.
 	ShardTimeout time.Duration
+	// MaxMergeRows bounds the rows, or groups, a query that runs on several
+	// shards may hold in memory while merging: the groups of a GROUP BY or
+	// aggregate, and the distinct rows of a DISTINCT. A query over the limit
+	// fails with ErrMergeLimitExceeded. Rows that are only streamed past (an
+	// ORDER BY merge, with or without LIMIT) are not counted. Zero uses 100000.
+	MaxMergeRows int
 	// IdempotencyTable is where idempotency keys are recorded, on every shard.
 	// It may be a name or schema.name. The default is go_shard_idempotency_keys.
 	// Create it with DB.EnsureIdempotencyTable or your own migrations.
@@ -71,6 +80,9 @@ func (c Config) validate() (*router.HashRouter, error) {
 	}
 	if c.MaxFanout < 0 {
 		add("MaxFanout cannot be negative")
+	}
+	if c.MaxMergeRows < 0 {
+		add("MaxMergeRows cannot be negative")
 	}
 	if c.ShardTimeout < 0 {
 		add("ShardTimeout cannot be negative")

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -82,19 +84,42 @@ type ShardExec struct {
 // closes any result sets already open, and is returned as a *ShardError. On
 // success the caller must close every returned Rows.
 func (e *Executor) Query(ctx context.Context, p plan.Plan) ([]ShardRows, error) {
+	rows, _, err := e.query(ctx, p, false)
+	return rows, err
+}
+
+// QueryPartial is Query that tolerates failing shards: every target is
+// attempted, and the shards that could not start their query are returned as
+// failures next to the rows of those that could. It fails only when no shard
+// answered, or the context ended. The caller must close every returned Rows.
+//
+// Only a failure to start the query is tolerated. An error while a shard is
+// streaming its rows surfaces when the rows are read.
+func (e *Executor) QueryPartial(ctx context.Context, p plan.Plan) ([]ShardRows, []*ShardError, error) {
+	return e.query(ctx, p, true)
+}
+
+func (e *Executor) query(ctx context.Context, p plan.Plan, partial bool) ([]ShardRows, []*ShardError, error) {
 	conns, err := e.conns(p.Targets)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	failCtx, fail := context.WithCancel(ctx)
 	defer fail()
 
 	var (
-		once  sync.Once
-		first error
+		mu     sync.Mutex
+		failed []*ShardError
 	)
-	setErr := func(err error) { once.Do(func() { first = err; fail() }) }
+	setErr := func(err *ShardError) {
+		mu.Lock()
+		defer mu.Unlock()
+		failed = append(failed, err)
+		if !partial {
+			fail()
+		}
+	}
 
 	results := make([]ShardRows, len(p.Targets))
 	var g errgroup.Group
@@ -123,16 +148,37 @@ func (e *Executor) Query(ctx context.Context, p plan.Plan) ([]ShardRows, error) 
 	}
 	_ = g.Wait() // goroutines record errors themselves; they never return one
 
+	if partial {
+		// Report failures in plan order, not in the order they happened. (When
+		// failing fast, the first error to happen is the one that matters.)
+		sort.Slice(failed, func(i, j int) bool {
+			return slices.Index(p.Targets, failed[i].Shard) < slices.Index(p.Targets, failed[j].Shard)
+		})
+	}
+
 	switch {
-	case first != nil:
-		closeAll(results)
-		return nil, first
 	case ctx.Err() != nil:
 		closeAll(results)
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
+	case !partial && len(failed) > 0:
+		closeAll(results)
+		return nil, nil, failed[0]
+	case partial && len(failed) == len(p.Targets):
+		return nil, nil, failed[0] // nobody answered
 	default:
-		return results, nil
+		return compact(results), failed, nil
 	}
+}
+
+// compact drops the empty slots of shards that failed.
+func compact(results []ShardRows) []ShardRows {
+	out := results[:0]
+	for _, r := range results {
+		if r.Rows != nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // Exec runs the plan's SQL on every target in parallel, at most MaxFanout at a

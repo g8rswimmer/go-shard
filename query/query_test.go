@@ -1,11 +1,13 @@
 package query
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/g8rswimmer/go-shard/analyze"
+	"github.com/g8rswimmer/go-shard/merge"
 )
 
 func mustBuild(t *testing.T, b interface{ Build() (Statement, error) }) Statement {
@@ -226,4 +228,68 @@ func TestInsertBuilderCanBeChangedAfterBuild(t *testing.T) {
 	if len(first.Args()) != 1 || len(second.Args()) != 2 || len(first.Analysis().Insert.Rows) != 1 {
 		t.Errorf("a built statement must not change when the builder does: %v / %v", first.Args(), second.Args())
 	}
+}
+
+func TestSelectMergePlan(t *testing.T) {
+	lim := func(n int64) *int64 { return &n }
+	tests := []struct {
+		name string
+		b    *SelectBuilder
+		sql  string
+		spec merge.Spec
+	}{
+		{"plain",
+			From("profiles").Columns("id", "name"),
+			`SELECT "id", "name" FROM "profiles"`,
+			merge.Spec{}},
+		{"order on selected columns, limit widened by offset",
+			From("profiles").Columns("id", "name").OrderBy("name", Desc).OrderBy("id", Asc).Limit(5).Offset(10),
+			`SELECT "id", "name" FROM "profiles" ORDER BY "name" DESC, "id" LIMIT 15`,
+			merge.Spec{Order: []merge.Order{{Col: 1, Desc: true, NullsFirst: true}, {Col: 0}}, Offset: 10, Limit: lim(5)}},
+		{"offset alone stays out of the shard statement",
+			From("profiles").Columns("id").OrderBy("id", Asc).Offset(3),
+			`SELECT "id" FROM "profiles" ORDER BY "id"`,
+			merge.Spec{Order: []merge.Order{{Col: 0}}, Offset: 3}},
+		{"order column that is not selected is added",
+			From("profiles").Columns("id").OrderBy("created", Asc).Where(Eq("age", 3)),
+			`SELECT "id", "created" FROM "profiles" WHERE "age" = $1 ORDER BY "created"`,
+			merge.Spec{Hidden: 1, Order: []merge.Order{{Col: 1}}}},
+		{"select * names hidden columns from the end",
+			From("profiles").OrderBy("created", Desc).OrderBy("id", Asc).Limit(3),
+			`SELECT *, "created", "id" FROM "profiles" ORDER BY "created" DESC, "id" LIMIT 3`,
+			merge.Spec{Hidden: 2, Order: []merge.Order{{Col: -2, Desc: true, NullsFirst: true}, {Col: -1}}, Limit: lim(3)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := mustBuild(t, tc.b).MergePlan()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.SQL != tc.sql {
+				t.Errorf("shard SQL:\n got  %s\n want %s", p.SQL, tc.sql)
+			}
+			if !reflect.DeepEqual(p.Spec, tc.spec) {
+				t.Errorf("spec:\n got  %+v\n want %+v", p.Spec, tc.spec)
+			}
+		})
+	}
+
+	t.Run("arguments are shared with the statement", func(t *testing.T) {
+		st := mustBuild(t, From("t").Where(Eq("a", 1), In("b", 2, 3)))
+		p, _ := st.MergePlan()
+		if !reflect.DeepEqual(p.Args, []any{1, 2, 3}) {
+			t.Errorf("args = %v", p.Args)
+		}
+	})
+
+	t.Run("only a SELECT has one", func(t *testing.T) {
+		for name, b := range map[string]interface{ Build() (Statement, error) }{
+			"update": Update("t").Set("a", 1).Where(Eq("id", 1)),
+			"delete": DeleteFrom("t").Where(Eq("id", 1)),
+		} {
+			if _, err := mustBuild(t, b).MergePlan(); !errors.Is(err, analyze.ErrUnsupportedQuery) {
+				t.Errorf("%s: err = %v, want ErrUnsupportedQuery", name, err)
+			}
+		}
+	})
 }

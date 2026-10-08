@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/g8rswimmer/go-shard/analyze"
+	"github.com/g8rswimmer/go-shard/merge"
 )
 
 // Dir is a sort direction.
@@ -44,6 +45,7 @@ type Statement struct {
 	args     []any
 	analysis analyze.Analysis
 	split    func(rows []int) (string, []any)
+	merge    *merge.Plan // set for a SELECT
 }
 
 // SQL returns the statement text, with $1, $2, ... placeholders.
@@ -51,6 +53,16 @@ func (s Statement) SQL() string { return s.sql }
 
 // Args returns the values for the placeholders.
 func (s Statement) Args() []any { return s.args }
+
+// MergePlan returns the statement each shard runs when this SELECT runs on
+// several shards, and how to merge the results. It is how a built SELECT
+// fans out without parsing SQL.
+func (s Statement) MergePlan() (merge.Plan, error) {
+	if s.merge == nil {
+		return merge.Plan{}, fmt.Errorf("%w: only a SELECT can return rows from several shards", analyze.ErrUnsupportedQuery)
+	}
+	return *s.merge, nil
+}
 
 // Analysis describes the statement for routing.
 func (s Statement) Analysis() analyze.Analysis { return s.analysis }
@@ -269,8 +281,17 @@ func (b *SelectBuilder) Build() (Statement, error) {
 		}
 		cols = strings.Join(q, ", ")
 	}
-	sql := "SELECT " + cols + " FROM " + s.table + s.whereSQL()
+	from := " FROM " + s.table + s.whereSQL()
+	sql := "SELECT " + cols + from
 
+	// The statement each shard runs when this one fans out: order columns that
+	// are not selected are added as hidden columns, and OFFSET is left to the
+	// merge (the shards' LIMIT covers the rows it skips).
+	var (
+		hidden  []string
+		order   []merge.Order
+		pending []int // star: positions of hidden order terms, named from the end
+	)
 	if len(b.order) > 0 {
 		items := make([]string, len(b.order))
 		for i, o := range b.order {
@@ -281,9 +302,28 @@ func (b *SelectBuilder) Build() (Statement, error) {
 				t.Desc = true
 			}
 			s.analysis.OrderBy = append(s.analysis.OrderBy, t)
+
+			mo := merge.Order{Desc: o.dir == Desc, NullsFirst: o.dir == Desc}
+			switch at := slices.Index(b.cols, o.col); {
+			case at >= 0:
+				mo.Col = at
+			case len(b.cols) > 0:
+				mo.Col = len(b.cols) + len(hidden)
+				hidden = append(hidden, s.ident(o.col))
+			default:
+				pending = append(pending, i)
+				hidden = append(hidden, s.ident(o.col))
+			}
+			order = append(order, mo)
 		}
 		sql += " ORDER BY " + strings.Join(items, ", ")
+		from += " ORDER BY " + strings.Join(items, ", ")
 	}
+	for k, i := range pending {
+		order[i].Col = k - len(pending) // -1 is the last hidden column
+	}
+
+	var offset int64
 	if b.limit != nil {
 		if *b.limit < 0 {
 			s.fail("Limit cannot be negative")
@@ -297,8 +337,26 @@ func (b *SelectBuilder) Build() (Statement, error) {
 		}
 		sql += fmt.Sprintf(" OFFSET %d", *b.offset)
 		s.analysis.Offset = b.offset
+		offset = *b.offset
 	}
-	return s.finish(sql)
+	if b.limit != nil {
+		from += fmt.Sprintf(" LIMIT %d", offset+*b.limit)
+	}
+
+	shardCols := cols
+	if len(hidden) > 0 {
+		shardCols += ", " + strings.Join(hidden, ", ")
+	}
+	st, err := s.finish(sql)
+	if err != nil {
+		return st, err
+	}
+	st.merge = &merge.Plan{
+		SQL:  "SELECT " + shardCols + from,
+		Args: st.args,
+		Spec: merge.Spec{Hidden: len(hidden), Order: order, Offset: offset, Limit: b.limit},
+	}
+	return st, nil
 }
 
 // ---- UPDATE ----------------------------------------------------------------

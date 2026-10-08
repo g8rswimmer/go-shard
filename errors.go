@@ -5,6 +5,7 @@ import (
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
+	"github.com/g8rswimmer/go-shard/merge"
 	"github.com/g8rswimmer/go-shard/plan"
 )
 
@@ -30,6 +31,10 @@ var (
 	// to a different shard from the transaction's, or to several. Nothing is
 	// sent to any shard, and the transaction remains usable.
 	ErrCrossShardTx = errors.New("shard: statement is outside the transaction's shard")
+
+	// ErrMergeLimitExceeded is returned when merging the results of several
+	// shards would hold more than Config.MaxMergeRows groups or distinct rows.
+	ErrMergeLimitExceeded = merge.ErrLimitExceeded
 
 	// ErrUnknownShard is returned when WithShard names a shard that is not
 	// configured.
