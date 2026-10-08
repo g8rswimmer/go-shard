@@ -18,6 +18,7 @@ If a change alters a requirement or design decision, update the doc in the same 
 
 ```sh
 make test              # unit tests with the race detector (no Docker)
+make test-nocgo        # unit tests without cgo; must also pass
 make vet lint          # go vet and golangci-lint
 make up                # 3 local Postgres shards on ports 5441-5443 (needs Docker)
 make test-integration  # integration tests, build tag `integration`
@@ -48,10 +49,20 @@ make down              # stop the shards and delete their data
 - `context.Context` is the first parameter of anything that does I/O.
 - Types that are built once and shared are immutable after construction (see `registry`, `router`).
 
+## cgo
+
+Only `analyze/pgparse` needs cgo (the SQL parser). Keep everything else
+buildable with `CGO_ENABLED=0`: files that need the parser carry
+`//go:build cgo`, and `make test-nocgo` must pass. See
+[docs/BUILDING.md](docs/BUILDING.md).
+
 ## Testing
 
 - Table-driven tests; unit tests must not need a database.
 - Integration tests use the build tag `integration` and real Postgres (`make up`).
+- The routing rules are pinned by a table of real SQL statements in
+  `plan/route_suite_test.go`. Add a case there for every new rule or bug. When
+  changing a safety rule, mutate it and check a test fails.
 - Fixed test vectors (for example router bucket numbers) pin behavior that must never change. If one fails, fix the code, not the vector.
 
 ## Workflow

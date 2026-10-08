@@ -30,7 +30,7 @@ func TestPlanWithShardKey(t *testing.T) {
 	db := routingDB(t, "a", "b", "c")
 	for _, key := range []any{1, 42, "profile-42", "123e4567-e89b-12d3-a456-426614174000"} {
 		want, _ := db.router.ShardFor(key)
-		p, err := db.WithShardKey(key).(*scoped).plan("SELECT 1", nil)
+		p, err := db.WithShardKey(key).(*scoped).plan("SELECT 1", nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -49,7 +49,7 @@ func TestPlanWithShardKeyRejectsUnroutableKeys(t *testing.T) {
 		key  any
 		want error
 	}{{nil, router.ErrNilKey}, {1.5, router.ErrUnsupportedKey}} {
-		_, err := db.WithShardKey(tc.key).(*scoped).plan("SELECT 1", nil)
+		_, err := db.WithShardKey(tc.key).(*scoped).plan("SELECT 1", nil, nil)
 		if !errors.Is(err, tc.want) {
 			t.Errorf("key %v: error = %v, want %v", tc.key, err, tc.want)
 		}
@@ -58,11 +58,11 @@ func TestPlanWithShardKeyRejectsUnroutableKeys(t *testing.T) {
 
 func TestPlanWithShard(t *testing.T) {
 	db := routingDB(t, "a", "b")
-	p, err := db.WithShard("b").(*scoped).plan("SELECT 1", nil)
+	p, err := db.WithShard("b").(*scoped).plan("SELECT 1", nil, nil)
 	if err != nil || len(p.Targets) != 1 || p.Targets[0] != "b" || p.Strategy != plan.Single {
 		t.Fatalf("plan = %+v, %v", p, err)
 	}
-	_, err = db.WithShard("zzz").(*scoped).plan("SELECT 1", nil)
+	_, err = db.WithShard("zzz").(*scoped).plan("SELECT 1", nil, nil)
 	if !errors.Is(err, ErrUnknownShard) || !strings.Contains(err.Error(), "[a b]") {
 		t.Errorf("error = %v, want ErrUnknownShard listing the configured shards", err)
 	}
@@ -70,7 +70,7 @@ func TestPlanWithShard(t *testing.T) {
 
 func TestPlanWithAllShards(t *testing.T) {
 	db := routingDB(t, "c", "a", "b")
-	p, err := db.WithAllShards().(*scoped).plan("SELECT 1", nil)
+	p, err := db.WithAllShards().(*scoped).plan("SELECT 1", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestPlanWithAllShards(t *testing.T) {
 
 func TestPlanKeepsSQLAndArgs(t *testing.T) {
 	db := routingDB(t, "a")
-	p, _ := db.WithShard("a").(*scoped).plan("SELECT $1", []any{7})
+	p, _ := db.WithShard("a").(*scoped).plan("SELECT $1", []any{7}, nil)
 	if p.SQL != "SELECT $1" || len(p.Args) != 1 || p.Args[0] != 7 {
 		t.Errorf("plan = %+v", p)
 	}

@@ -6,6 +6,8 @@ Start with the design docs: [requirements](docs/REQUIREMENTS.md),
 ## Requirements
 
 - Go 1.26 or newer
+- A C compiler (`gcc` or `clang`): the SQL parser uses cgo. The first build is
+  slow; see [docs/BUILDING.md](docs/BUILDING.md)
 - Docker (integration tests and the local shards)
 - [golangci-lint](https://golangci-lint.run/) v1.64.8
 
@@ -14,6 +16,7 @@ Start with the design docs: [requirements](docs/REQUIREMENTS.md),
 ```sh
 make help              # list all targets
 make test              # unit tests with the race detector (no Docker)
+make test-nocgo        # the same without cgo (raw SQL routing is skipped)
 make up                # start 3 local Postgres shards (ports 5441-5443)
 make test-integration  # integration tests; starts its own Postgres containers (needs Docker)
 make lint              # golangci-lint

@@ -1,5 +1,6 @@
 // Quickstart shows the basics: describe your tables, open the shards, write a
-// row to the shard that owns its key, and read it back.
+// row to the shard that owns its key, then read and update it with plain SQL.
+// The library finds the shard from the shard key in the SQL.
 //
 // It uses the three local shards from `make up`. Set SHARD_DSNS (comma
 // separated) to use others.
@@ -7,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,8 +35,9 @@ func run() error {
 	defer cancel()
 
 	// 1. Describe your tables: profiles are spread across shards by id.
+	// The key type is required: it makes "42" and 42 find the same shard.
 	reg, err := registry.New(
-		registry.Sharded("profiles", registry.Key("id")),
+		registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt)),
 	)
 	if err != nil {
 		return err
@@ -69,7 +72,8 @@ func run() error {
 		_, _ = db.WithAllShards().Exec(context.Background(), "DROP TABLE IF EXISTS profiles")
 	}()
 
-	// 4. Write: WithShardKey picks the shard that owns this id.
+	// 4. Write: WithShardKey picks the shard that owns this id. (Routing an
+	// INSERT from its VALUES is not available yet.)
 	names := map[int64]string{1: "Ada", 2: "Grace", 3: "Edsger", 4: "Barbara", 5: "Alan", 6: "Margaret"}
 	ids := make([]int64, 0, len(names))
 	for id := range names {
@@ -89,8 +93,9 @@ func run() error {
 		}
 	}
 
-	// 5. Read: the same key finds the same shard.
-	rows, err := db.WithShardKey(int64(3)).Query(ctx, "SELECT name FROM profiles WHERE id = $1", int64(3))
+	// 5. Read and update with plain SQL: the library reads the shard key from
+	// the WHERE clause and runs the statement on the shard that owns it.
+	rows, err := db.Query(ctx, "SELECT name FROM profiles WHERE id = $1", int64(3))
 	if err != nil {
 		return err
 	}
@@ -100,7 +105,26 @@ func run() error {
 		if err := rows.Scan(&name); err != nil {
 			return err
 		}
-		fmt.Printf("read profile 3 back: %s\n", name)
+		fmt.Printf("read profile 3: %s\n", name)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	res, err := db.Exec(ctx, "UPDATE profiles SET name = $2 WHERE id = $1", int64(3), "Edsger W. Dijkstra")
+	if err != nil {
+		return err
+	}
+	for sid, o := range res.PerShard {
+		fmt.Printf("renamed profile 3 on %s (%d row)\n", sid, o.RowsAffected)
+	}
+
+	// 6. A statement that does not say which shard it belongs to is refused
+	// rather than guessed. The error says how to fix it.
+	_, err = db.Query(ctx, "SELECT name FROM profiles WHERE name = $1", "Ada")
+	if errors.Is(err, shard.ErrShardKeyRequired) {
+		fmt.Printf("refused: %v\n", err)
+		return nil
+	}
+	return fmt.Errorf("expected the keyless query to be refused, got %v", err)
 }

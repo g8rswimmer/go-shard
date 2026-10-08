@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build vet lint test test-integration test-integration-compose up down
+.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose up down
 
 COMPOSE_DSNS := postgres://shard:shard@localhost:5441/shard?sslmode=disable,postgres://shard:shard@localhost:5442/shard?sslmode=disable,postgres://shard:shard@localhost:5443/shard?sslmode=disable
 
@@ -17,6 +17,9 @@ lint: ## Run golangci-lint
 
 test: ## Run unit tests with the race detector
 	go test -race ./...
+
+test-nocgo: ## Run unit tests without cgo
+	CGO_ENABLED=0 go test ./...
 
 test-integration: ## Run integration tests (needs Docker; starts its own Postgres containers)
 	go test -race -p 1 -tags integration ./...

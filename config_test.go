@@ -13,7 +13,7 @@ import (
 
 func testRegistry(t *testing.T) *registry.Registry {
 	t.Helper()
-	reg, err := registry.New(registry.Sharded("profiles", registry.Key("id")))
+	reg, err := registry.New(registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -127,3 +127,10 @@ func unhex(c byte) (byte, bool) {
 		return 0, false
 	}
 }
+
+// IsUUIDString reports whether s is a UUID in canonical 8-4-4-4-12 form, which
+// Canonical treats as a UUID rather than as text.
+func IsUUIDString(s string) bool {
+	_, ok := parseUUID(s)
+	return ok
+}
