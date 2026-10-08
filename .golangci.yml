@@ -17,3 +17,10 @@ linters:
     - goimports
     - errorlint
     - bodyclose
+
+issues:
+  exclude-rules:
+    # ShardID, ShardConfig, ShardError... are the domain's own terms and are
+    # used in the docs and error messages; shard.ShardID reads fine.
+    - linters: [revive]
+      text: "stutters"

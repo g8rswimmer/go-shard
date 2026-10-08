@@ -207,11 +207,14 @@ Joins are allowed only if every non-global table is in the same colocation group
 
 ### 5.4 Executor and shard pool (FR-1, FR-5)
 
-- One `*sql.DB` per shard, with its own pool settings.
-- `Run` fans out with an `errgroup` and a semaphore sized by `MaxFanout`, so a wide query cannot open unbounded work.
-- Each shard call gets a derived context with the per-shard timeout; the caller's context cancels everything.
-- **Failure policy:** fail-fast by default (first error cancels the rest). `AllowPartial()` returns rows plus a `[]ShardError`.
-- Reads can be retried once on connection errors. Writes are never retried unless an idempotency key is supplied (FR-7).
+- `exec.Pool` holds one `*sql.DB` (pgx stdlib driver) per shard with its own `MaxConns` (default 10). `exec.Open` connects and pings every shard; if any fails it closes the rest and returns a `*ShardError` naming the shard. DSNs never appear in errors.
+- The pool depends on a small `Conn` interface (the subset of `*sql.DB` it uses), so the executor is unit tested with a fake `database/sql` driver and no database.
+- `Executor.Query` and `Executor.Exec` run a `plan.Plan` on every target in parallel through an `errgroup` limited to `MaxFanout` (default 8), so a wide statement cannot open unbounded work. Plans with no targets, unknown shards or repeated shards are rejected before anything runs.
+- Each shard call gets its own context with the per-shard timeout (if any), derived from the caller's context. The timeout covers streaming the rows too, so `exec.Rows` releases the context on `Close`: rows must always be closed.
+- **Reads fail fast** (first error cancels the other shards' queries and closes any result sets already open). The cancellation is wired with `context.AfterFunc` and removed once each query returns, so cancelling on exit never cuts off rows the caller is still reading. A test pins this.
+- **Writes do not fail fast.** Every target is attempted and each outcome is reported, because a write that succeeded on some shards must be visible. The facade turns the outcomes into a `WriteResult` plus an error if any shard failed.
+- `AllowPartial()` for reads (rows plus a `[]ShardError`) arrives with the merge layer in M6.
+- Reads can be retried once on connection errors. Writes are never retried unless an idempotency key is supplied (FR-7). (Retries are not implemented yet.)
 - Rows are streamed per shard so the merger can start before all shards finish.
 
 ### 5.5 Merger (FR-5)
@@ -293,17 +296,34 @@ The facade's operations are exposed as an interface, so application code depends
 type Querier interface {
     Query(ctx context.Context, sql string, args ...any) (Rows, error)
     Exec(ctx context.Context, sql string, args ...any) (WriteResult, error)
-    Begin(ctx context.Context, target TxTarget) (Tx, error)
-    Explain(ctx context.Context, sql string, args ...any) (Explain, error)
+    // Added in later milestones:
+    Begin(ctx context.Context, target TxTarget) (Tx, error)              // M5
+    Explain(ctx context.Context, sql string, args ...any) (Explain, error) // M7
 }
 // *shard.DB implements Querier.
 ```
 
-`shardtest` provides three tools:
+Today (M2) the caller supplies the routing, with handles that are themselves `Querier`s:
+
+```go
+db.WithShardKey(id).Exec(ctx, "INSERT INTO profiles ...", id, name)  // shard that owns id
+db.WithShard("shard-02").Query(ctx, "SELECT ...")                     // a named shard
+db.WithAllShards().Exec(ctx, "CREATE TABLE ...")                      // every shard
+db.Query(ctx, "SELECT ...")                                           // ErrShardKeyRequired until M3
+```
+
+When the analyzer arrives (M3), plain `db.Query` routes from the SQL and these become the explicit overrides from FR-4.
+
+- `Rows` is an interface (`Next`, `Scan`, `Columns`, `Err`, `Close`) that `*sql.Rows` satisfies and merged results will too.
+- `WriteResult{PerShard map[ShardID]ShardOutcome}` is defined now, so M4 adds batch splitting and idempotency without changing the type. A write that fails on any shard returns an error and the result still lists every shard.
+- `Query` on more than one shard returns `ErrUnsupportedQuery` until merging exists (M6).
+
+`shardtest` provides these tools (the fake and the routing assertions arrive in M7):
 
 | Tool | Use |
 |---|---|
-| `shardtest.NewCluster(t, n, opts...)` | Starts `n` Postgres containers (testcontainers), applies migrations from the given source, returns a ready `shard.Config`, and registers cleanup with `t.Cleanup`. If `SHARDTEST_DSNS` is set, it uses those instances instead and truncates tables between tests. |
+| `shardtest.NewCluster(t, n, opts...)` | Starts `n` Postgres containers in parallel (testcontainers; image from `WithPostgresVersion`, `SHARDTEST_POSTGRES_VERSION`, default 14) named `shard-01`..., and registers cleanup with `t.Cleanup`. Applying migrations (`WithMigrations`) arrives with M8. If `SHARDTEST_DSNS` is set, it uses those instances instead and **drops and recreates their `public` schema** at the start of each test; tests sharing them must run with `go test -p 1`. |
+| Cluster helpers (M2) | `cluster.Open(t, reg)` opens a `*shard.DB` and closes it at cleanup; `Config(reg)`; `IDs()`; `DSN(id)`; `ExecAll(t, sql)` runs DDL on every shard; `Direct(t, id)` returns a plain `*sql.DB` that bypasses go-shard, so a test can assert where a row physically is; `Count(t, id, sql)`; `Seed(t, db, table, rows...)` inserts each row on the shard that owns it (global tables on every shard). |
 | `shardtest.NewFake(reg, shards...)` | In-memory `Querier`. Runs the real Analyze, Route and Plan stages but records the plan instead of executing, and returns canned rows set with `fake.Returns(...)`. No database needed. |
 | Assertions | `shardtest.AssertRoutes(t, q, sql, args, wantShards...)`, `AssertSingleShard`, `AssertFanout`, and `cluster.Seed(t, table, rows)`, which inserts each row on its owning shard. |
 
@@ -374,19 +394,23 @@ Conventions:
 ```go
 cfg := shard.Config{
     Shards: []shard.ShardConfig{
-        {ID: "shard-01", DSN: "...", MaxConns: 20, Buckets: shard.Range(0, 511)},
-        {ID: "shard-02", DSN: "...", MaxConns: 20, Buckets: shard.Range(512, 1023)},
+        // Buckets are optional: leave them off every shard to split 0-1023 evenly
+        // in the order listed. Otherwise list them on every shard.
+        {ID: "shard-01", DSN: "...", MaxConns: 20, Buckets: []router.BucketRange{shard.Range(0, 511)}},
+        {ID: "shard-02", DSN: "...", MaxConns: 20, Buckets: []router.BucketRange{shard.Range(512, 1023)}},
     },
-    MaxFanout:     8,
-    ShardTimeout:  5 * time.Second,
-    MaxMergeRows:  100_000,
-    Registry:      reg,
-    Hooks:         observe.Slog(logger),
+    MaxFanout:     8,                // default 8
+    ShardTimeout:  5 * time.Second,  // default none (the caller's context still applies)
+    Registry:      reg,              // required
+    // Added in later milestones:
+    MaxMergeRows:  100_000,          // M6
+    Hooks:         observe.Slog(logger), // M9
 }
 db, err := shard.Open(ctx, cfg)
 ```
 
-- `Open` validates the registry and bucket map, then pings every shard. A bad configuration fails startup.
+- `Open` validates the config (every problem is reported at once, wrapping `ErrInvalidConfig`), builds the router, then connects to and pings every shard. A bad configuration or an unreachable shard fails startup, and nothing is left open.
+- `db.Health(ctx)` pings every shard in parallel and returns per-shard health, latency and pool stats.
 - DSNs are never logged. Config can be built from a struct, env or file by the caller; the library only requires the struct.
 
 ## 7. Error model

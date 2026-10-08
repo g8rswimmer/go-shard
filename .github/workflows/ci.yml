@@ -48,7 +48,7 @@ jobs:
           go-version-file: go.mod
       - name: Start shards
         run: make up
-      - run: make test-integration
+      - run: make test-integration-compose
       - name: Stop shards
         if: always()
         run: make down
