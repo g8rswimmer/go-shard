@@ -315,3 +315,66 @@ func TestQueryUsesThePerShardStatement(t *testing.T) {
 		t.Errorf("ran %v, want the per-shard statement", q)
 	}
 }
+
+func TestQueryPartialKeepsTheShardsThatAnswer(t *testing.T) {
+	boom := func(msg string) *fakeShard {
+		return &fakeShard{query: func(context.Context) (int, error) { return 0, errors.New(msg) }}
+	}
+	slow := &fakeShard{query: blockUntilDone}
+	ok := &fakeShard{query: func(context.Context) (int, error) { return 2, nil }}
+	pool := newPool(t, boom("first"), ok, boom("third"), ok)
+
+	rows, failed, err := NewExecutor(pool, Options{}).QueryPartial(context.Background(), planFor("s0", "s1", "s2", "s3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Shard != "s1" || rows[1].Shard != "s3" {
+		t.Errorf("rows from %v, want s1 and s3", rows)
+	}
+	if len(failed) != 2 || failed[0].Shard != "s0" || failed[1].Shard != "s2" {
+		t.Errorf("failed = %v, want s0 and s2 in plan order", failed)
+	}
+	for _, r := range rows {
+		n := 0
+		for r.Rows.Next() {
+			n++
+		}
+		if n != 2 || r.Rows.Err() != nil {
+			t.Errorf("shard %s: %d rows, err %v", r.Shard, n, r.Rows.Err())
+		}
+		_ = r.Rows.Close()
+	}
+
+	// A failing shard must not cancel the others (unlike Query): the slow
+	// shard here finishes only when its own timeout ends it.
+	pool = newPool(t, boom("x"), slow)
+	start := time.Now()
+	_, failed, err = NewExecutor(pool, Options{ShardTimeout: 150 * time.Millisecond}).
+		QueryPartial(context.Background(), planFor("s0", "s1"))
+	if err == nil && len(failed) != 2 {
+		t.Errorf("failed = %v, want both shards (one failed, one timed out)", failed)
+	}
+	if time.Since(start) < 100*time.Millisecond {
+		t.Error("the slow shard was cancelled by the other shard's failure")
+	}
+}
+
+func TestQueryPartialFailsWhenNobodyAnswers(t *testing.T) {
+	boom := &fakeShard{query: func(context.Context) (int, error) { return 0, errors.New("down") }}
+	pool := newPool(t, boom, boom)
+	rows, failed, err := NewExecutor(pool, Options{}).QueryPartial(context.Background(), planFor("s0", "s1"))
+	var se *ShardError
+	if !errors.As(err, &se) || rows != nil || failed != nil {
+		t.Errorf("rows=%v failed=%v err=%v, want only a *ShardError", rows, failed, err)
+	}
+}
+
+func TestQueryPartialCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := newPool(t, &fakeShard{query: blockUntilDone}, &fakeShard{query: blockUntilDone})
+	time.AfterFunc(50*time.Millisecond, cancel)
+	_, _, err := NewExecutor(pool, Options{}).QueryPartial(ctx, planFor("s0", "s1"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}

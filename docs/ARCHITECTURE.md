@@ -140,7 +140,6 @@ type Plan struct {
     Targets  []ShardID
     Strategy Strategy
     Reason   string       // why these shards (for Explain)
-    Merge    []MergeStep  // empty for Single
 }
 
 // exec
@@ -148,10 +147,13 @@ type Executor interface {
     Run(ctx context.Context, p Plan) (ShardRows, error)
 }
 
-// merge: behind an interface so a join-capable version can be added (FR-5)
-type Merger interface {
-    Merge(ctx context.Context, steps []MergeStep, in ShardRows) (Rows, error)
+// merge: a fan-out SELECT is rewritten by a Planner into the statement every
+// shard runs plus a Spec; Merge combines the shards' rows by the Spec. The Spec
+// is the seam: a join-capable merge would replace the Planner and Merge (FR-5).
+type Planner interface {
+    PlanMerge(sql string, args []any) (Plan, error) // Plan = shard SQL + Args + Spec
 }
+func Merge(spec Spec, srcs []Source, opts Options) (*Rows, error)
 ```
 
 ## 4. Request flow
@@ -168,14 +170,15 @@ db.Query(ctx, "SELECT ... FROM profiles WHERE id = $1", 42)
 
 ### 4.2 Fan-out read (all shards)
 
-Only allowed when the caller opts in with `WithAllShards()`; otherwise the router returns `ErrShardKeyRequired` (FR-3, FR-4). Reading from more than one shard is added with the merge layer (M6); until then it returns `ErrUnsupportedQuery`.
+Only allowed when the caller opts in with `WithAllShards()` (or when the key conditions name several shards); otherwise the router returns `ErrShardKeyRequired` (FR-3, FR-4).
 
 ```
 SELECT ... ORDER BY created_at DESC LIMIT 20   (WithAllShards)
-  -> Plan{Strategy: All, Merge: [OrderedMerge(created_at DESC), Limit(20)]}
-  -> shard SQL rewritten to LIMIT 20 (offset + limit pushed down)
-  -> Executor runs on all shards in parallel
-  -> Merger k-way merges sorted streams, stops at 20 rows
+  -> Plan{Strategy: All, Targets: every shard}
+  -> Planner.PlanMerge   shard SQL: LIMIT 20 (offset + limit pushed down), ORDER BY kept;
+                         Spec: Order[created_at DESC], Limit 20
+  -> Executor.Query      runs the shard SQL on all shards in parallel, rows streamed
+  -> merge.Merge         k-way merge of the sorted streams; stops (and closes the shards) at 20 rows
 ```
 
 ### 4.3 Routing rules (analysis of predicates)
@@ -264,26 +267,43 @@ Two producers of `Analysis`, one consumer (`plan.Route`):
 - A plan may give each shard its own statement (`Plan.PerShard`, read through `Plan.StatementFor`): this is how a multi-row INSERT sends every shard only its rows. `ShardExec` also reports the VALUES rows the shard received and whether the write was a replay.
 - `Executor.ExecIdempotent` runs the same fan-out with the idempotency protocol of 5.6.
 - `Executor.Begin` returns an `exec.Tx`: one shard, one `*sql.Tx`, one connection, with `Query` / `Exec` / `Commit` / `Rollback` (5.7).
-- `AllowPartial()` for reads (rows plus a `[]ShardError`) arrives with the merge layer in M6.
+- `Executor.QueryPartial` is `Query` that does not fail fast: every target is attempted, the shards that could not start their query are returned as `[]*ShardError` next to the rows of those that could, and it fails only when no shard answered or the context ended. A failure while a shard streams is not tolerated; it stops the iteration (5.5).
 - Reads can be retried once on connection errors; this is not implemented yet. Writes are never retried by the library: a retry is the caller's, made safe by an idempotency key (5.6).
 - Rows are streamed per shard so the merger can start before all shards finish.
 
 ### 5.5 Merger (FR-5)
 
-Supported merge steps:
+A SELECT that runs on more than one shard is rewritten and merged; a SELECT on one shard is not touched.
 
-| Step | How |
-|---|---|
-| `ORDER BY` | K-way merge using a heap over the per-shard sorted streams. Order columns missing from the select list are added as hidden columns, then dropped. |
-| `LIMIT` / `OFFSET` | Each shard gets `LIMIT offset+limit`; the merger skips `offset` rows and stops after `limit`. |
-| `DISTINCT` | Hash set over output rows (bounded by `MaxMergeRows`). |
-| `COUNT`, `SUM`, `MIN`, `MAX` | Combined across shards. |
-| `AVG` | Rewritten to `SUM` and `COUNT` per shard, divided at merge. |
-| `GROUP BY` | Per-shard groups are re-aggregated by group key. `HAVING` is applied after the merge, not pushed to shards. |
+**Planner.** `merge.Planner` (implemented by `analyze/pgparse` with the parser and deparser, and by built `query` SELECTs without any parser) returns a `merge.Plan`: the SQL every shard runs, its arguments, and a `merge.Spec` that says how to combine the answers. The Spec is plain data (columns and how each is combined, hidden-column count, order, offset, limit, distinct, having), so `merge` knows nothing about SQL text.
 
-Rejected with a clear error: window functions, subqueries, cross-shard joins, `FILTER`/`DISTINCT` inside aggregates, and `ORDER BY` expressions that cannot be reproduced at merge time.
+| Construct | Shard statement | Merge |
+|---|---|---|
+| `ORDER BY` | kept, so each shard returns sorted rows. Order items not in the select list (a column, a function, an aggregate) are added as hidden trailing columns; with `SELECT *` they are named from the end (negative index) because the position of later columns is unknown. | k-way merge with a heap over the sorted streams, ties to the lower shard; one row per shard in memory |
+| `LIMIT` / `OFFSET` | `OFFSET` removed, `LIMIT` becomes offset + limit; parameters used only by them are renumbered away | skip `offset`, stop after `limit`, then close the shard rows |
+| `DISTINCT` | kept | hash set of the output rows, bounded by `MaxMergeRows` |
+| `COUNT`, `SUM` | as written | added; NULL (a shard with no rows) is ignored. Numbers add as int64, float64 or exact decimals |
+| `MIN`, `MAX` | as written | smallest / largest, NULL ignored |
+| `AVG` | rewritten to `SUM` (column keeps the name `avg`) plus a hidden `COUNT` | sum / count; an average of integers shows 16 decimals as PostgreSQL does |
+| `GROUP BY` | as written, plus a hidden copy of each group item that is not already a selected column, ordinal or alias | rows with equal keys are combined; groups are held in memory, bounded by `MaxMergeRows` |
+| `HAVING` | removed; the aggregates it uses are added as hidden columns | evaluated on merged groups. `AND`/`OR`/`NOT` over comparisons of an aggregate (or group column) with a constant or parameter, with SQL's three-valued logic (`NOT (avg < 43)` is not true for a NULL average) |
+| aggregate `ORDER BY`, `LIMIT`, `OFFSET` | removed | sorted in memory over the merged groups, then cut |
 
-Memory is bounded by `MaxMergeRows`; exceeding it fails the query rather than exhausting the process. Deep `OFFSET` is documented as expensive.
+Aggregation reads every shard completely when the query runs (so a streaming error from a shard fails `Query`), then closes the connections. Everything else streams.
+
+**Rejected** with `ErrUnsupportedQuery` naming the construct: window functions, subqueries (in any clause), `WITH`, `UNION` / `INTERSECT` / `EXCEPT`, `FOR UPDATE`, `DISTINCT ON`, `FETCH ... WITH TIES`, aggregates other than `count`/`sum`/`min`/`max`/`avg` (`string_agg`, `array_agg`, `stddev`, ...), `DISTINCT` / `FILTER` / `ORDER BY` inside an aggregate, an expression around an aggregate (`sum(x) / count(*)`), `GROUPING SETS` / `ROLLUP` / `CUBE`, `SELECT *` with aggregates or `GROUP BY`, `SELECT DISTINCT` with an order term that is not selected, `ORDER BY ... USING`, and a `LIMIT` that is not a number or parameter. Cross-shard joins are refused earlier by routing (`ErrCrossShardJoin`).
+
+**Values.** Rows are read as `database/sql` driver values and compared by Go type: integers and floats numerically, decimals (`numeric` arrives as text; the column's type name tells the merge to compare it as a number) exactly with `big.Rat`, text byte by byte, times by instant. `Rows.Scan` converts as `database/sql` does for the common destinations and `sql.Scanner`.
+
+**Known differences from one database.**
+- Text is ordered as the `C` collation. If a database uses another collation (`en_US.UTF-8`), `ORDER BY` on a text column can order differently across shards than PostgreSQL would on one, and `MIN`/`MAX` of text can differ. Use `COLLATE "C"` in the query or a `C` database collation for text you order by.
+- An average of decimals can show a different number of decimals than PostgreSQL (the value is the same).
+- Floating-point sums can differ in their last digits, because shards add in a different order.
+- A `GROUP BY` name that is both an input column and an output alias is read as the alias when it names a select item.
+
+**Failure.** By default the first shard error cancels the others and fails the query. `shard.AllowPartial(ctx)` merges the shards that answered and reports the rest through `shard.ShardErrors(rows)`; the result then covers only those shards. Only a failure to start the query is tolerated: an error while a shard streams stops the iteration and appears in `Rows.Err()`, labelled with the shard.
+
+**Memory.** Streaming merges (ordered or not, with or without `LIMIT`) hold one row per shard. Aggregation, `GROUP BY` and `DISTINCT` hold their groups or distinct rows and fail with `ErrMergeLimitExceeded` past `Config.MaxMergeRows` (default 100,000) instead of exhausting memory. Deep `OFFSET` is expensive because each shard returns `offset + limit` rows; prefer a keyset condition.
 
 ### 5.6 Writes (FR-7)
 
@@ -480,8 +500,8 @@ cfg := shard.Config{
     MaxFanout:     8,                // default 8
     ShardTimeout:  5 * time.Second,  // default none (the caller's context still applies)
     Registry:      reg,              // required
+    MaxMergeRows:  100_000,          // default 100000: groups / distinct rows a merge may hold
     // Added in later milestones:
-    MaxMergeRows:  100_000,          // M6
     Hooks:         observe.Slog(logger), // M9
 }
 db, err := shard.Open(ctx, cfg)
@@ -495,7 +515,7 @@ db, err := shard.Open(ctx, cfg)
 
 Sentinel errors, wrapped with context, usable with `errors.Is`:
 
-`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig`, `ErrShardKeyImmutable`, `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing`, `ErrCrossShardTx`, `ErrTxDone` (all in place), and later `ErrMergeLimitExceeded`; plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
+`ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnknownTable`, `ErrUnknownShard`, `ErrUnsupportedQuery`, `ErrMissingArgument`, `ErrInvalidConfig`, `ErrShardKeyImmutable`, `ErrIdempotencyKeyReused`, `ErrIdempotencyTableMissing`, `ErrCrossShardTx`, `ErrTxDone`, `ErrMergeLimitExceeded` (all in place); plus `*ShardError` carrying a `ShardID` and cause. The root package re-exports the values defined in `analyze` and `plan`, so `errors.Is` works whichever layer returned the error. Messages say what to do (for example, "add a shard-key predicate or use WithAllShards()").
 
 ## 8. Testing strategy
 
@@ -504,7 +524,7 @@ Sentinel errors, wrapped with context, usable with `errors.Is`:
 | Unit | Registry validation, key canonicalization vectors, bucket map validation, predicate analysis, merge steps, plan rendering | No DB; table-driven tests; fake `Executor` returns canned `ShardRows` |
 | Integration | Routing and fan-out, ordered merge, writes with partial failure, single-shard tx, migrations and drift | 3 real Postgres containers via `shardtest.NewCluster` (the same public package users get); one container is stopped to test failures |
 | Examples | Every example builds and runs | CI builds `./examples/...`; an integration job runs each against real Postgres (5.12) |
-| Property | Merge equals running the same query on a single combined database | Load identical data into 1 DB and into 3 shards, compare results for generated queries |
+| Property | Merge equals running the same query on a single combined database | `TestFanOutMatchesOneDatabase`: identical rows in 1 DB (a private schema on shard 1) and in 3 shards; 600 generated queries per run (rows, `DISTINCT`, aggregates, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, colocated joins); a total order is compared row for row, otherwise as a set plus an in-order check. `FANOUT_SEED` and `FANOUT_QUERIES` explore further |
 | Compatibility | Postgres 14 and the newest supported release; Go 1.26 | CI matrix |
 
 ## 9. Dependencies
@@ -547,6 +567,7 @@ Resolved from REQUIREMENTS section 7:
 - Minimum versions: Go 1.26, PostgreSQL 14+.
 - Builder: a small fluent builder in its own package `query` (SELECT / INSERT / UPDATE / DELETE).
 - Idempotency table: created explicitly with `DB.EnsureIdempotencyTable` or by the user's migrations (`shard.IdempotencyDDL`), never implicitly at first use.
+- Merge design: the SQL is rewritten once into shard SQL plus a data `Spec`, and a separate `Merge` function combines rows by the Spec (no SQL knowledge), rather than a merger that interprets steps; `Plan` carries no merge steps.
 - Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
 - Migrations: wrap `golang-migrate` behind `Migrator`.
 

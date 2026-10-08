@@ -190,8 +190,8 @@ func TestIntegration(t *testing.T) {
 		if _, err := db.Query(ctx, "SELECT * FROM profiles"); !errors.Is(err, shard.ErrShardKeyRequired) {
 			t.Errorf("error = %v, want ErrShardKeyRequired", err)
 		}
-		if _, err := db.WithAllShards().Query(ctx, "SELECT 1"); !errors.Is(err, shard.ErrUnsupportedQuery) {
-			t.Errorf("error = %v, want ErrUnsupportedQuery (merging arrives in a later milestone)", err)
+		if _, err := db.WithAllShards().Query(ctx, "UPDATE profiles SET name = 'x' RETURNING id"); !errors.Is(err, shard.ErrUnsupportedQuery) {
+			t.Errorf("error = %v, want ErrUnsupportedQuery (only a SELECT is merged across shards)", err)
 		}
 		if _, err := db.WithShard("nope").Query(ctx, "SELECT 1"); !errors.Is(err, shard.ErrUnknownShard) {
 			t.Errorf("error = %v, want ErrUnknownShard", err)
@@ -362,9 +362,9 @@ func TestIntegration(t *testing.T) {
 				t.Errorf("%s: Query error %v, Exec error %v; want %v", name, qerr, eerr, tc.want)
 			}
 		}
-		// Reading from several shards needs result merging, which comes later.
-		if _, err := db.Query(ctx, "SELECT * FROM profiles WHERE id IN (1, 2, 3, 4, 5, 6)"); !errors.Is(err, shard.ErrUnsupportedQuery) {
-			t.Errorf("multi-shard read: error = %v, want ErrUnsupportedQuery", err)
+		// A read of several shards is merged; one whose results cannot be merged is refused.
+		if _, err := db.Query(ctx, "SELECT id, row_number() OVER (ORDER BY id) FROM profiles WHERE id IN (1, 2, 3, 4, 5, 6)"); !errors.Is(err, shard.ErrUnsupportedQuery) {
+			t.Errorf("multi-shard window function: error = %v, want ErrUnsupportedQuery", err)
 		}
 		after := int64(0)
 		for _, sid := range cluster.IDs() {

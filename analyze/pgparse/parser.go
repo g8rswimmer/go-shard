@@ -213,10 +213,26 @@ func (Parser) SplitRows(sql string, args []any, rows []int) (string, []any, erro
 	}
 	sel.ValuesLists = kept
 
+	newArgs, err := renumberParams(res.Stmts[0].Stmt, args)
+	if err != nil {
+		return "", nil, err
+	}
+
+	out, err := pg.Deparse(res)
+	if err != nil {
+		return "", nil, fmt.Errorf("shard: cannot rebuild the INSERT: %w", err)
+	}
+	return out, newArgs, nil
+}
+
+// renumberParams renumbers the parameters a statement still uses to $1, $2, ...
+// with no gaps, in the order they are first used, and returns the arguments
+// they now refer to. The result is the same every time it is asked for.
+func renumberParams(stmt *pg.Node, args []any) ([]any, error) {
 	renumber := map[int32]int32{}
 	var newArgs []any
 	var walkErr error
-	walkNodes(res.Stmts[0].Stmt.ProtoReflect(), func(n *pg.Node) bool {
+	walkNodes(stmt.ProtoReflect(), func(n *pg.Node) bool {
 		p := n.GetParamRef()
 		if p == nil || walkErr != nil {
 			return walkErr == nil
@@ -234,15 +250,7 @@ func (Parser) SplitRows(sql string, args []any, rows []int) (string, []any, erro
 		p.Number = to
 		return true
 	})
-	if walkErr != nil {
-		return "", nil, walkErr
-	}
-
-	out, err := pg.Deparse(res)
-	if err != nil {
-		return "", nil, fmt.Errorf("shard: cannot rebuild the INSERT: %w", err)
-	}
-	return out, newArgs, nil
+	return newArgs, walkErr
 }
 
 var _ analyze.RowSplitter = Parser{}

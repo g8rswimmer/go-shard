@@ -14,6 +14,10 @@ What that means for you:
 
 Statements built with package [`query`](../query) never need the parser, so a
 program that only uses the builder and explicit routing can build without cgo.
+That includes reading from every shard: a built SELECT is merged (ordering,
+limit, offset) without the parser. Raw SQL that runs on several shards, and any
+`GROUP BY` or aggregate, needs the parser (or an analyzer that also implements
+`merge.Planner`, below).
 
 ## Requirements
 
@@ -66,3 +70,9 @@ type Analyzer interface {
 It reports the tables, the conditions on columns and the joins in a statement
 (see package `analyze`); go-shard decides what that means for shard selection.
 Set it with `Config.Analyzer`.
+
+Merging the rows of a query that runs on several shards also needs the SQL
+rewritten (extra columns for the sort, `AVG` split into a sum and a count).
+The parser does that through `merge.Planner`; an analyzer that does not
+implement it can route raw SQL, but a raw query that spans shards is refused
+with a message saying so.

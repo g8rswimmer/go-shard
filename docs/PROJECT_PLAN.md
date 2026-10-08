@@ -76,11 +76,12 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** a rollback test shows profile and addresses roll back together, and a statement targeting another shard fails without side effects.
 
 ### M6 Fan-out and merge (L) - FR-5, FR-6
-- `Merger` interface; steps: ordered k-way merge (with hidden order columns), limit/offset pushdown, `DISTINCT`, `COUNT`/`SUM`/`MIN`/`MAX`, `AVG` rewrite, `GROUP BY` re-aggregation, `HAVING` after merge.
-- Streaming per-shard rows, `MaxMergeRows`, `ErrMergeLimitExceeded`.
-- Failure policy: fail-fast and `AllowPartial` with `[]ShardError`.
-- Reject unsupported constructs with clear errors (window functions, subqueries, cross-shard joins).
-- Property test: the same generated queries on one combined database and on 3 shards must return the same results.
+- `merge` package: `Planner` (SQL rewrite for a fan-out) and `Merge` over a data `Spec` instead of a step-interpreting `Merger`: ordered k-way merge (with hidden order columns), limit/offset pushdown, `DISTINCT`, `COUNT`/`SUM`/`MIN`/`MAX`, `AVG` rewrite, `GROUP BY` re-aggregation, `HAVING` after merge (SQL three-valued logic).
+- `analyze/pgparse` implements `Planner` (deparse-based rewrite); built `query` SELECTs implement it without a parser, so fan-out works without cgo.
+- Streaming per-shard rows (flat memory), `Config.MaxMergeRows`, `ErrMergeLimitExceeded`.
+- Failure policy: fail-fast and `shard.AllowPartial(ctx)` with `shard.ShardErrors(rows)` (`Executor.QueryPartial`).
+- Reject unsupported constructs with clear errors (window functions, subqueries, unmergeable aggregates, ...); cross-shard joins are refused by routing.
+- Property test (`TestFanOutMatchesOneDatabase`): generated queries on one combined database and on 3 shards return the same results.
 - `examples/fanout`.
 - **Done when:** the property test passes for the supported subset, and memory use during a merge is flat with respect to result size up to `MaxMergeRows`.
 

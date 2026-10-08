@@ -19,6 +19,15 @@
 //	db.WithShard("shard-02").Query(ctx, "SELECT ...")
 //	db.WithAllShards().Exec(ctx, "CREATE TABLE ...")
 //
+// A query that runs on several shards (WithAllShards, or key conditions that
+// name more than one) is merged into one result, as a single database would
+// give it: ORDER BY, LIMIT, OFFSET, DISTINCT, aggregates, GROUP BY and HAVING.
+// Constructs that cannot be merged are refused with ErrUnsupportedQuery. Use
+// AllowPartial to tolerate shards that do not answer.
+//
+//	rows, err := db.WithAllShards().Query(ctx,
+//	    "SELECT team, count(*) FROM players GROUP BY team ORDER BY 2 DESC")
+//
 // Statements built with package query carry their routing and need no SQL
 // parsing.
 package shard
@@ -41,6 +50,7 @@ type DB struct {
 	exec      *exec.Executor
 	analyzer  analyze.Analyzer // nil when raw SQL cannot be analyzed (no cgo)
 	idemTable string           // where idempotency keys are recorded
+	maxMerge  int              // rows or groups a merge may hold
 	next      atomic.Uint64    // spreads statements any shard can answer
 }
 
@@ -75,8 +85,13 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if idemTable == "" {
 		idemTable = exec.DefaultIdempotencyTable
 	}
+	maxMerge := cfg.MaxMergeRows
+	if maxMerge == 0 {
+		maxMerge = defaultMaxMergeRows
+	}
 	return &DB{
 		idemTable: idemTable,
+		maxMerge:  maxMerge,
 		registry:  cfg.Registry,
 		router:    r,
 		pool:      pool,
