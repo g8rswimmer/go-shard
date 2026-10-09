@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose up down
+.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose bench bench-integration examples up down
 
 COMPOSE_DSNS := postgres://shard:shard@localhost:5441/shard?sslmode=disable,postgres://shard:shard@localhost:5442/shard?sslmode=disable,postgres://shard:shard@localhost:5443/shard?sslmode=disable
 
@@ -28,6 +28,22 @@ test-integration: ## Run integration tests (needs Docker; starts its own Postgre
 # WARNING: wipes the public schema of those databases.
 test-integration-compose: ## Run integration tests against `make up` shards
 	SHARDTEST_DSNS='$(COMPOSE_DSNS)' go test -race -p 1 -tags integration ./...
+
+BENCHTIME ?= 1s
+
+bench: ## Run the benchmarks that need no database (BENCHTIME=1x for a quick check)
+	go test -run '^$$' -bench . -benchmem -benchtime $(BENCHTIME) ./...
+
+# Against the shards from `make up`. WARNING: wipes the public schema of those databases.
+bench-integration: ## Run the benchmarks against `make up` shards
+	SHARDTEST_DSNS='$(COMPOSE_DSNS)' go test -run '^$$' -bench . -benchmem -benchtime $(BENCHTIME) -p 1 -tags integration ./...
+
+EXAMPLES := quickstart colocation fanout writes explain migrations observability
+
+examples: $(addprefix example-,$(EXAMPLES)) ## Run every example against the `make up` shards
+
+example-%: ## Run one example (example-quickstart, ...) against the `make up` shards
+	go run ./examples/$*
 
 up: ## Start the 3 local Postgres shards and wait until healthy
 	docker compose up -d --wait

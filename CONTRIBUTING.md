@@ -20,6 +20,8 @@ make test-nocgo        # the same without cgo (raw SQL routing is skipped)
 make up                # start 3 local Postgres shards (ports 5441-5443)
 make test-integration  # integration tests; starts its own Postgres containers (needs Docker)
 make lint              # golangci-lint
+make bench             # benchmarks that need no database (BENCHTIME=1x for a quick check)
+make examples          # run every example against the make up shards
 make down              # stop the shards and delete their data
 ```
 
@@ -46,5 +48,8 @@ POSTGRES_VERSION=18 make up
 - Work on a branch, one milestone step per PR.
 - Add tests with the change: unit tests for logic, integration tests (build tag
   `integration`) for anything that talks to Postgres.
-- `make vet lint test` must pass.
+- `make vet lint test` must pass. Every exported symbol needs a doc comment
+  (the linter checks), and no test may leave a goroutine running (`goleak`).
+- Touching routing, merging or the executor: run `make bench` before and after,
+  and record a meaningful change in `docs/BENCHMARKS.md`.
 - Update the docs if a requirement or design decision changes.

@@ -17,11 +17,11 @@ import (
 type Strategy = plan.Strategy
 
 const (
-	// Single: exactly one shard.
+	// Single means exactly one shard.
 	Single = plan.Single
-	// Multi: some, but not all, shards.
+	// Multi means some, but not all, shards.
 	Multi = plan.Multi
-	// All: every shard.
+	// All means every shard.
 	All = plan.All
 )
 

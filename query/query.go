@@ -33,7 +33,9 @@ import (
 type Dir int
 
 const (
+	// Asc sorts smallest first.
 	Asc Dir = iota
+	// Desc sorts largest first.
 	Desc
 )
 

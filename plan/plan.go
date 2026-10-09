@@ -22,6 +22,7 @@ const (
 	All
 )
 
+// String returns "single", "multi" or "all".
 func (s Strategy) String() string {
 	switch s {
 	case Single:

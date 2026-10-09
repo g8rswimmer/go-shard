@@ -19,7 +19,15 @@ linters:
     - bodyclose
 
 issues:
+  # golangci-lint hides revive's "exported symbol should have a comment" by
+  # default; we want it (godoc is the reference), so the default exclusions are
+  # off and the ones we do want are listed.
+  exclude-use-default: false
   exclude-rules:
+    # Close errors are not actionable where they are ignored (deferred closes,
+    # rows already read).
+    - linters: [errcheck]
+      text: "Error return value of .*(Close|Rollback|Flush|Unlock|Print|Fprint).* is not checked"
     # ShardID, ShardConfig, ShardError... are the domain's own terms and are
     # used in the docs and error messages; shard.ShardID reads fine.
     - linters: [revive]

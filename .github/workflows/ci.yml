@@ -31,6 +31,8 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go test -race ./...
+      # one iteration of every benchmark: they must keep compiling and running
+      - run: make bench BENCHTIME=1x
 
   nocgo:
     # The library must still build and pass its tests without cgo; only raw SQL
@@ -63,7 +65,10 @@ jobs:
           go-version-file: go.mod
       - name: Start shards
         run: make up
+      # includes the failure-injection tests and TestExamplesRun, which runs
+      # every example and checks its key output lines
       - run: make test-integration-compose
+      - run: make bench-integration BENCHTIME=1x
       - name: Stop shards
         if: always()
         run: make down

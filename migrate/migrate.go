@@ -34,6 +34,7 @@ type State struct {
 	Dirty bool
 }
 
+// String renders the state for people: "none", "3" or "3 (dirty)".
 func (s State) String() string {
 	switch {
 	case !s.Applied && s.Dirty:
@@ -105,6 +106,7 @@ const (
 	ContinueOnFailure
 )
 
+// String returns the name of the policy.
 func (p Policy) String() string {
 	switch p {
 	case HaltOnFailure:
@@ -198,7 +200,10 @@ type ShardError struct {
 	Err   error
 }
 
+// Error names the shard and gives the underlying error.
 func (e *ShardError) Error() string { return fmt.Sprintf("shard %s: %v", e.Shard, e.Err) }
+
+// Unwrap returns the underlying error, for errors.Is and errors.As.
 func (e *ShardError) Unwrap() error { return e.Err }
 
 // ShardResult is what happened to one shard.

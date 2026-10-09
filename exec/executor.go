@@ -54,6 +54,8 @@ func NewExecutor(pool *Pool, opts Options) *Executor {
 type Rows struct {
 	*sql.Rows
 	cancel context.CancelFunc
+	// pause and restart stop and start the shard timeout again; see pushable.
+	pause, restart func()
 }
 
 // Close closes the result set and releases its context.
@@ -133,7 +135,7 @@ func (e *Executor) query(ctx context.Context, p plan.Plan, partial bool) ([]Shar
 			break
 		}
 		g.Go(func() error {
-			sctx, cancel := e.shardContext(ctx)
+			sctx, cancel, pause, restart := e.queryContext(ctx)
 			// Cancel this shard's query if another shard fails first. The hook
 			// is removed once the query returns, so failCtx being cancelled when
 			// Query exits does not cut off rows the caller is still reading.
@@ -142,17 +144,28 @@ func (e *Executor) query(ctx context.Context, p plan.Plan, partial bool) ([]Shar
 			hctx, began := e.hooks.start(sctx, observe.Query, id)
 			rows, err := conns[i].QueryContext(hctx, query, args...)
 			e.hooks.done(hctx, observe.Query, id, began, 0, false, err)
+			if err == nil {
+				pause() // until the slowest shard has answered
+			}
 			stop()
 			if err != nil {
 				cancel()
 				setErr(&ShardError{Shard: id, Err: err})
 				return nil
 			}
-			results[i] = ShardRows{Shard: id, Rows: &Rows{Rows: rows, cancel: cancel}}
+			results[i] = ShardRows{Shard: id, Rows: &Rows{Rows: rows, cancel: cancel, pause: pause, restart: restart}}
 			return nil
 		})
 	}
 	_ = g.Wait() // goroutines record errors themselves; they never return one
+
+	// Every shard has answered or failed. Time spent waiting for the slowest
+	// must not count against reading the rows of the others.
+	for _, r := range results {
+		if r.Rows != nil {
+			r.Rows.restart()
+		}
+	}
 
 	if partial {
 		// Report failures in plan order, not in the order they happened. (When
@@ -251,6 +264,17 @@ func (e *Executor) conns(targets []router.ShardID) ([]Conn, error) {
 		}
 	}
 	return conns, nil
+}
+
+// queryContext is shardContext for a query, whose timeout can be restarted once
+// the rows are ready to be read.
+func (e *Executor) queryContext(parent context.Context) (context.Context, context.CancelFunc, func(), func()) {
+	if e.timeout <= 0 {
+		ctx, cancel := context.WithCancel(parent)
+		return ctx, cancel, func() {}, func() {}
+	}
+	c := newPushable(parent, e.timeout)
+	return c, c.cancel, c.pause, c.restart
 }
 
 func (e *Executor) shardContext(parent context.Context) (context.Context, context.CancelFunc) {
