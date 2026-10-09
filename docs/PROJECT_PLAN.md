@@ -94,10 +94,10 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** golden-file tests for Explain output of single, multi and all-shard queries, and the unit-test example runs without Docker.
 
 ### M8 Migrations (M) - FR-10
-- `Migrator` interface; `golang-migrate` implementation, one instance per shard, shared source.
-- Parallel apply with advisory lock per shard; `HaltOnFailure` / `ContinueOnFailure`.
-- `Status` with drift detection; failed shard stays at its last good version and is re-runnable.
-- `shardtest.WithMigrations`.
+- `migrate.Migrator` interface; `golang-migrate` implementation, one instance per shard per operation, the same source (`FromURL` or `FromFS`). Forward-only.
+- `Runner.Up` / `UpTo`: parallel (bounded) with golang-migrate's advisory lock per shard; `HaltOnFailure` / `ContinueOnFailure`; a `Result` for every shard.
+- `Runner.Status` with drift detection (`Drift`, `Behind`, `Dirty`, `Unreadable`); a failed shard stays at its last good version and is re-runnable; `Runner.Force` repairs a crash-dirty shard.
+- `DB.Migrations`, `shardtest.WithMigrations` / `WithMigrationsFS` / `Cluster.Migrator`.
 - `examples/migrations`.
 - **Done when:** an integration test fails a migration on one shard, shows drift in `Status`, fixes it, re-runs, and ends with all shards at the same version.
 
