@@ -35,6 +35,12 @@ The first release, v0.1.0, is being prepared (see
 - **Testing support.** `shardtest.NewCluster` (containers or your own
   databases), `shardtest.NewFake` with routing assertions.
 - **Examples** for every feature, run against real PostgreSQL in CI.
+- **Adoption guide** ([docs/ADOPTING.md](docs/ADOPTING.md)) and the
+  `examples/adopt` loader: choosing shard keys, colocation, loading existing
+  data and verifying it.
+- **Demo guide** ([docs/DEMO.md](docs/DEMO.md)): eight scenarios to try by hand
+  against three local shards, with `make demo-setup`, `make demo-reset` and
+  `make demo-check`, which runs the guide in CI and compares its output.
 - **Documentation:** supported and unsupported queries, error reference,
   operations guide, benchmarks, versioning policy.
 

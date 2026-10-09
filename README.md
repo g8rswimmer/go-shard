@@ -79,6 +79,8 @@ go run ./examples/quickstart
 | | |
 |---|---|
 | [Examples](examples) | One runnable program per feature, each with its output |
+| [Adopting it with existing data](docs/ADOPTING.md) | Choosing keys, colocating tables, loading and verifying |
+| [Demo guide](docs/DEMO.md) | Try routing, fan-out, failures and migrations by hand against three local shards |
 | [Supported and unsupported queries](docs/QUERIES.md) | What is routed, merged, refused, and why |
 | [Error reference](docs/ERRORS.md) | Every error, when it happens, what to do |
 | [Operating it](docs/OPERATIONS.md) | Timeouts, shard failures, retries, capacity |
