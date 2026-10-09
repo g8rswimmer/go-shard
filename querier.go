@@ -121,6 +121,15 @@ type Querier interface {
 	QueryStatement(ctx context.Context, st Statement) (Rows, error)
 	// ExecStatement is Exec for a built Statement; it needs no SQL parsing.
 	ExecStatement(ctx context.Context, st Statement) (WriteResult, error)
+	// Explain says where a statement would run and why, without running it.
+	// It routes exactly as Query and Exec do, so it returns the same errors.
+	Explain(ctx context.Context, sql string, args ...any) (Explain, error)
+	// ExplainStatement is Explain for a built Statement.
+	ExplainStatement(ctx context.Context, st Statement) (Explain, error)
+	// Explainer returns an Explainer that explains with the options given:
+	// ShardPlans adds each shard's own PostgreSQL plan, Analyze measures it.
+	// Explainer() with none is Explain and ExplainStatement.
+	Explainer(opts ...ExplainOption) Explainer
 }
 
 type routeKind int

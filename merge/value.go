@@ -153,6 +153,19 @@ func assign(dest, src any) error {
 		return fmt.Errorf("shard: Scan needs a non-nil pointer, got %T", dest)
 	}
 	elem := rv.Elem()
+	if elem.Kind() == reflect.Pointer {
+		// *T, as database/sql allows: NULL leaves it nil, anything else gets a T.
+		if src == nil {
+			elem.SetZero()
+			return nil
+		}
+		target := reflect.New(elem.Type().Elem())
+		if err := assign(target.Interface(), src); err != nil {
+			return err
+		}
+		elem.Set(target)
+		return nil
+	}
 	if src == nil {
 		return fmt.Errorf("shard: cannot scan NULL into %T; scan into a pointer or a sql.Null type", dest)
 	}

@@ -1,0 +1,10 @@
+op:        INSERT
+strategy:  multi
+targets:   shard-02, shard-03
+reason:    INSERT of 4 row(s) by profiles.id -> [shard-02 shard-03]
+shard sql:
+  shard-02: INSERT INTO profiles (id, name) VALUES ($1, 'b')
+  shard-03: INSERT INTO profiles (id, name) VALUES ($1, 'a'), ($2, 'c'), ($3, 'd')
+rows:
+  shard-02: 1
+  shard-03: 0, 2, 3

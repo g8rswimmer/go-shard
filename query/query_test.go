@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -268,8 +269,13 @@ func TestSelectMergePlan(t *testing.T) {
 			if p.SQL != tc.sql {
 				t.Errorf("shard SQL:\n got  %s\n want %s", p.SQL, tc.sql)
 			}
-			if !reflect.DeepEqual(p.Spec, tc.spec) {
-				t.Errorf("spec:\n got  %+v\n want %+v", p.Spec, tc.spec)
+			got := p.Spec
+			got.Order = slices.Clone(got.Order)
+			for i := range got.Order {
+				got.Order[i].Label = ""
+			}
+			if !reflect.DeepEqual(got, tc.spec) {
+				t.Errorf("spec:\n got  %+v\n want %+v", got, tc.spec)
 			}
 		})
 	}

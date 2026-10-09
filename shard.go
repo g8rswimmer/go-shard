@@ -30,6 +30,13 @@
 //
 // Statements built with package query carry their routing and need no SQL
 // parsing.
+//
+// Explain says where a statement would run, and why, without running it; it
+// returns the same refusals running the statement would. In a unit test,
+// package shardtest's NewFake answers the same question with no database.
+//
+//	e, err := db.Explain(ctx, "SELECT name FROM profiles WHERE id = $1", id)
+//	fmt.Println(e) // strategy, targets, reason, shard SQL, merge steps
 package shard
 
 import (
@@ -77,6 +84,13 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
+	ex := exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout})
+	return newDB(cfg, r, pool, ex), nil
+}
+
+// newDB applies the config's defaults. ex is nil for a Planner, which never
+// runs anything.
+func newDB(cfg Config, r *router.HashRouter, pool *exec.Pool, ex *exec.Executor) *DB {
 	analyzer := cfg.Analyzer
 	if analyzer == nil {
 		analyzer = defaultAnalyzer()
@@ -95,9 +109,9 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		registry:  cfg.Registry,
 		router:    r,
 		pool:      pool,
-		exec:      exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout}),
+		exec:      ex,
 		analyzer:  analyzer,
-	}, nil
+	}
 }
 
 // anyShard picks the shard for a statement every shard can answer, such as a

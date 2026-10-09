@@ -1,0 +1,5 @@
+op:        SELECT
+strategy:  single
+targets:   shard-02
+reason:    routed by key: profiles.id has 1 key value(s) -> [shard-02]
+shard sql: SELECT "id", "name" FROM "profiles" WHERE "id" = $1

@@ -1,0 +1,5 @@
+op:        UPDATE
+strategy:  all
+targets:   shard-01, shard-02, shard-03
+reason:    WithAllShards()
+shard sql: UPDATE "profiles" SET "name" = $1 WHERE "name" = $2

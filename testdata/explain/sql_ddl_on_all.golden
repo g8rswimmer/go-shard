@@ -1,0 +1,5 @@
+op:        IndexStmt
+strategy:  all
+targets:   shard-01, shard-02, shard-03
+reason:    WithAllShards()
+shard sql: CREATE INDEX profiles_name ON profiles (name)

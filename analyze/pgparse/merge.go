@@ -46,7 +46,7 @@ func (Parser) PlanMerge(sql string, args []any) (merge.Plan, error) {
 		return merge.Plan{}, unsupported("only a SELECT can return rows from several shards")
 	}
 
-	b := &mergeBuilder{sel: sel, w: &walker{args: args}}
+	b := &mergeBuilder{sel: sel, w: &walker{args: args}, version: res.Version}
 	spec, err := b.build()
 	if err != nil {
 		return merge.Plan{}, err
@@ -73,6 +73,7 @@ type mergeBuilder struct {
 	explicit  int            // targets written in the statement
 	cols      []merge.Column // aggregate mode: one per target, hidden ones too
 	hidden    int
+	version   int32 // of the parsed statement, needed to deparse a piece of it
 }
 
 // pendingOrder is an order term waiting for the final hidden count.
@@ -241,6 +242,13 @@ func (b *mergeBuilder) planAggregate(spec *merge.Spec) error {
 // classify says how a select-list expression is combined. For AVG it rewrites
 // the call to SUM in place and reports isAvg so the caller can add the COUNT.
 func (b *mergeBuilder) classify(val *pg.Node) (col merge.Column, isAvg bool, err error) {
+	label := b.text(val) // before an AVG is rewritten to a SUM
+	col, isAvg, err = b.classifyExpr(val)
+	col.Label = label
+	return col, isAvg, err
+}
+
+func (b *mergeBuilder) classifyExpr(val *pg.Node) (col merge.Column, isAvg bool, err error) {
 	fc := val.GetFuncCall()
 	if fc != nil && fc.Over == nil && isAggregateName(funcName(fc)) {
 		f, ok := mergeFuncs[funcName(fc)]
@@ -273,7 +281,7 @@ func (b *mergeBuilder) hiddenCount(avg *pg.Node) int {
 	c := proto.Clone(avg).(*pg.Node)
 	c.GetFuncCall().Funcname = []*pg.Node{pg.MakeStrNode("count")}
 	b.sel.TargetList = append(b.sel.TargetList, pg.MakeResTargetNodeWithVal(c, -1))
-	b.cols = append(b.cols, merge.Column{Func: merge.Count})
+	b.cols = append(b.cols, merge.Column{Func: merge.Count, Label: b.text(c)})
 	b.hidden++
 	return len(b.cols) - 1
 }
@@ -327,6 +335,7 @@ type orderTerm struct {
 	col   pendingOrder
 	desc  bool
 	nulls bool
+	label string
 }
 
 // orderTerms resolves each ORDER BY item to a column of the shard result.
@@ -351,13 +360,16 @@ func (b *mergeBuilder) orderTerms() ([]orderTerm, error) {
 			// the default chosen above
 		}
 
-		t := orderTerm{desc: desc, nulls: nullsFirst}
+		t := orderTerm{desc: desc, nulls: nullsFirst, label: b.text(sb.Node)}
 		idx, found, err := b.findColumn(sb.Node)
 		switch {
 		case err != nil:
 			return nil, err
 		case found:
 			t.col = pendingOrder{index: idx, hidden: -1}
+			if l := b.selectLabel(idx); l != "" && sb.Node.GetAConst() != nil {
+				t.label = l // ORDER BY 2 reads better as the column it names
+			}
 		default:
 			// Not in the select list: select a copy of the expression. This
 			// covers a column, a function call, or an aggregate.
@@ -429,7 +441,7 @@ func (b *mergeBuilder) finishOrder(terms []orderTerm) []merge.Order {
 		if t.col.hidden >= 0 {
 			col = t.col.hidden - b.hidden // -1 is the last hidden column
 		}
-		out[i] = merge.Order{Col: col, Desc: t.desc, NullsFirst: t.nulls}
+		out[i] = merge.Order{Col: col, Desc: t.desc, NullsFirst: t.nulls, Label: t.label}
 	}
 	return out
 }
@@ -611,4 +623,30 @@ func isSameColumn(n *pg.Node, name string) bool {
 	}
 	last := cr.Fields[len(cr.Fields)-1].GetString_()
 	return last != nil && last.Sval == name
+}
+
+// selectLabel is the text of select-list item i as the statement wrote it, or
+// empty if there is no such item.
+func (b *mergeBuilder) selectLabel(i int) string {
+	switch {
+	case b.aggregate && i < len(b.cols):
+		return b.cols[i].Label
+	case i < b.explicit:
+		return b.text(b.sel.TargetList[i].GetResTarget().GetVal())
+	default:
+		return ""
+	}
+}
+
+// text renders an expression back to SQL, for describing a merge. It
+// returns "?" for an expression the deparser cannot render.
+func (b *mergeBuilder) text(n *pg.Node) string {
+	res := &pg.ParseResult{Version: b.version, Stmts: []*pg.RawStmt{{Stmt: &pg.Node{Node: &pg.Node_SelectStmt{SelectStmt: &pg.SelectStmt{
+		TargetList: []*pg.Node{pg.MakeResTargetNodeWithVal(proto.Clone(n).(*pg.Node), -1)},
+	}}}}}}
+	out, err := pg.Deparse(res)
+	if err != nil {
+		return "?"
+	}
+	return strings.TrimPrefix(out, "SELECT ")
 }

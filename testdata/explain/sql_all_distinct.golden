@@ -1,0 +1,8 @@
+op:        SELECT
+strategy:  all
+targets:   shard-01, shard-02, shard-03
+reason:    WithAllShards()
+shard sql: SELECT DISTINCT country FROM profiles ORDER BY country
+merge:
+  1. OrderedMerge(country)
+  2. Distinct

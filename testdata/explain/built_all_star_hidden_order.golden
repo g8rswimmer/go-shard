@@ -1,0 +1,9 @@
+op:        SELECT
+strategy:  all
+targets:   shard-01, shard-02, shard-03
+reason:    WithAllShards()
+shard sql: SELECT *, "created_at" FROM "profiles" ORDER BY "created_at" DESC LIMIT 5
+merge:
+  1. OrderedMerge(created_at DESC)
+  2. Limit(5)
+  3. DropHidden(1)

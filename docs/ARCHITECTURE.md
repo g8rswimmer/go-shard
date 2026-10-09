@@ -38,14 +38,14 @@ Because the plan is a plain value, routing and merging are unit-testable without
 
 ```
 go-shard/
-  shard.go            Public facade: Open, DB, Query/Exec/Begin/Explain
+  shard.go            Public facade: Open, DB, Query/Exec/Begin/Explain (explain.go: Explain, Planner)
   config.go           Config structs and validation (FR-1)
   registry/           Table metadata: sharded, colocated, global (FR-2)
   router/             Key canonicalization, hashing, bucket map (FR-3)
   analyze/            Engine-neutral Analysis of a statement; Analyzer interface (FR-4)
     pgparse/          pg_query_go adapter (only package that needs cgo)
   query/              Builder: SELECT / UPDATE / DELETE statements that carry their Analysis (FR-4)
-  plan/               Plan type, strategies, Explain rendering (FR-9)
+  plan/               Plan type and strategies (Explain rendering is in the shard package)
   exec/               Shard pool, parallel executor, tx pinning (FR-1, FR-8)
   merge/              Ordered merge, limit/offset, distinct, aggregates (FR-5)
   migrate/            Fan-out migration runner, status, drift (FR-10)
@@ -358,20 +358,30 @@ defer tx.Rollback() // harmless after Commit (returns ErrTxDone)
 
 ### 5.8 Explain (FR-9)
 
-`db.Explain(ctx, sql, args...)` runs Analyze, Route and Plan and returns:
+`Explain(ctx, sql, args...)` and `ExplainStatement(ctx, st)` are on `Querier`, so `*DB`, the `WithShardKey` / `WithShard` / `WithAllShards` handles, `Tx` and the fake all have them. They route the statement with the same code `Query` and `Exec` use (`scoped.plan`) and stop before executing, so **Explain returns the errors running the statement would**: `ErrShardKeyRequired`, `ErrCrossShardJoin`, `ErrUnsupportedQuery` for a fan-out that cannot be merged, and inside a transaction `ErrCrossShardTx`. The result:
 
-```
-Explain{
-  Strategy: All,
-  Targets:  [shard-01 shard-02 shard-03],
-  Reason:   "no shard-key predicate; WithAllShards()",
-  Merge:    [OrderedMerge(created_at DESC), Limit(20)],
-  ShardSQL: "SELECT ... LIMIT 20",
-  ShardPlans: map[ShardID]string  // only with WithShardPlans(); runs EXPLAIN per shard
+```go
+type Explain struct {
+    Op         string                 // SELECT, INSERT, ...; empty if it could not be read
+    Strategy   Strategy               // Single, Multi, All
+    Targets    []ShardID
+    Reason     string                 // which rule or override chose them
+    ShardSQL   string                 // what every target runs (the rewritten SELECT for a fan-out)
+    PerShard   map[ShardID]string     // instead of ShardSQL, for a split multi-row INSERT
+    Rows       map[ShardID][]int      // INSERT: which VALUES rows each shard gets
+    Merge      []string               // what happens to the shards' rows, in order
+    Notes      []string
+    ShardPlans map[ShardID]string     // only with the ShardPlans / Analyze options
 }
 ```
 
-Per-shard plans use Postgres `EXPLAIN`; `ANALYZE` is opt-in because it executes the statement.
+`Explain.String()` renders it for people (the golden files under `testdata/explain/` pin the layout); the fields are for code.
+
+- **Merge steps** come from the `merge.Spec` the planner produced (`Spec.Steps()`), the same value `Merge` executes, so the description cannot drift from the behavior: `Aggregate(by team: count(*) = sum of counts, avg(score) = sum / count)`, `Having(...)`, `Sort(...)` or `OrderedMerge(created_at DESC)`, `Distinct`, `Offset(n)`, `Limit(n)`, `DropHidden(n)`. Planners fill `Column.Label` and `Order.Label` with the expression as written, only for this purpose.
+- **Statement kind** is read with the analyzer even under an override (`WithAllShards`); when it cannot be read (no analyzer, odd SQL) `Op` is empty, and a failure to plan the merge becomes a note instead of an error.
+- **Per-shard plans.** `Querier.Explainer(shard.ShardPlans())` returns an `Explainer` that makes Explain run PostgreSQL's `EXPLAIN` for the SQL each target would receive (parameters are bound as in a real call), in parallel through the executor (`Executor.ExplainShards`), failing with the shard's `*ShardError`. `shard.Analyze()` uses `EXPLAIN (ANALYZE)`, which runs the statement: it runs inside a transaction that is **always rolled back**, so a write leaves no rows (a sequence still advances, a trigger that calls out still calls out). The options are fixed when the `Explainer` is made (functional options), not passed per call: `Explain` already takes `args ...any`, and a context value would be invisible at the call site, which matters for ANALYZE since it runs the statement.
+- **In a transaction**, plans are read inside it (`Tx.Explain`), and `Analyze` is refused: running the statement there could not be undone separately.
+- **`shard.Planner`** (`NewPlanner(cfg)`) is a DB that connects to nothing: it validates the same `Config` (DSNs optional) and makes the same routing decisions, and offers `Explain` plus `WithShardKey` / `WithShard` / `WithAllShards`. `shardtest.NewFake` is built on it, which is why a routing assertion in a unit test means what it means in production.
 
 ### 5.9 Migrations (FR-10)
 
@@ -398,8 +408,11 @@ The facade's operations are exposed as an interface, so application code depends
 type Querier interface {
     Query(ctx context.Context, sql string, args ...any) (Rows, error)
     Exec(ctx context.Context, sql string, args ...any) (WriteResult, error)
-    // Added in a later milestone:
-    Explain(ctx context.Context, sql string, args ...any) (Explain, error) // M7
+    QueryStatement(ctx context.Context, st Statement) (Rows, error)
+    ExecStatement(ctx context.Context, st Statement) (WriteResult, error)
+    Explain(ctx context.Context, sql string, args ...any) (Explain, error)
+    ExplainStatement(ctx context.Context, st Statement) (Explain, error)
+    Explainer(opts ...ExplainOption) Explainer // ShardPlans(), Analyze()
 }
 // *shard.DB implements Querier.
 ```
@@ -414,16 +427,17 @@ db.WithAllShards().Exec(ctx, "CREATE TABLE ...")                      // every s
 
 - `Rows` is an interface (`Next`, `Scan`, `Columns`, `Err`, `Close`) that `*sql.Rows` satisfies and merged results will too.
 - `WriteResult{PerShard map[ShardID]ShardOutcome}`: see 5.6. A write that fails on any shard returns an error and the result still lists every shard.
-- `Query` on more than one shard returns `ErrUnsupportedQuery` until merging exists (M6).
+- `Query` on more than one shard merges the rows (5.5).
 
-`shardtest` provides these tools (the fake and the routing assertions arrive in M7):
+`shardtest` provides these tools:
 
 | Tool | Use |
 |---|---|
 | `shardtest.NewCluster(t, n, opts...)` | Starts `n` Postgres containers in parallel (testcontainers; image from `WithPostgresVersion`, `SHARDTEST_POSTGRES_VERSION`, default 14) named `shard-01`..., and registers cleanup with `t.Cleanup`. Applying migrations (`WithMigrations`) arrives with M8. If `SHARDTEST_DSNS` is set, it uses those instances instead and **drops and recreates their `public` schema** at the start of each test; tests sharing them must run with `go test -p 1`. |
 | Cluster helpers (M2) | `cluster.Open(t, reg)` opens a `*shard.DB` and closes it at cleanup; `Config(reg)`; `IDs()`; `DSN(id)`; `ExecAll(t, sql)` runs DDL on every shard; `Direct(t, id)` returns a plain `*sql.DB` that bypasses go-shard, so a test can assert where a row physically is; `Count(t, id, sql)`; `Stop(t, id)` shuts a container down to test a real outage (it skips the test when the cluster uses `SHARDTEST_DSNS`); `Seed(t, db, table, rows...)` inserts each row on the shard that owns it (global tables on every shard). |
-| `shardtest.NewFake(reg, shards...)` | In-memory `Querier`. Runs the real Analyze, Route and Plan stages but records the plan instead of executing, and returns canned rows set with `fake.Returns(...)`. No database needed. |
-| Assertions | `shardtest.AssertRoutes(t, q, sql, args, wantShards...)`, `AssertSingleShard`, `AssertFanout`, and `cluster.Seed(t, table, rows)`, which inserts each row on its owning shard. |
+| `shardtest.NewFake(t, reg, shards...)` | A `Querier` that needs no database. It routes every statement with the real registry, router and analyzer (through `shard.Planner`), **records** it with its `Explain`, and answers with what you stub: `StubRows(match, columns, rows...)`, `StubAffected(match, n)` (per target shard), `StubError(match, err)`. `match` is a substring of the SQL; the last matching stub wins. It also provides `WithShardKey` / `WithShard` / `WithAllShards`. It does not run SQL, keep data, merge, or fake transactions. |
+| Fake assertions (methods on the fake, failing the `testing.TB` it was built with) | `AssertRoutes(match, shards...)` (exactly these shards, any order), `AssertSingleShard(match) ShardID`, `AssertFanout(match, shards...)`, `LastPlan() shard.Explain`, `Calls()` (kind, SQL, args, plan, routing error) and `Reset()`. They look at the most recent statement whose SQL contains `match`, and fail with the SQL seen when none does or when it was refused. |
+| `cluster.Seed(t, db, table, rows...)` | Inserts each row on its owning shard. |
 
 The fake reuses the real router and analyzer, so a routing assertion in a unit test means the same thing as in production. The fake does not emulate SQL results; the integration tests cover that.
 
@@ -431,12 +445,12 @@ Example of a user's unit test:
 
 ```go
 func TestProfileLoadsFromOneShard(t *testing.T) {
-    fake := shardtest.NewFake(registry(), "shard-01", "shard-02", "shard-03")
+    fake := shardtest.NewFake(t, registry(), "shard-01", "shard-02", "shard-03")
     svc := profiles.NewService(fake)          // depends on shard.Querier
 
     _, _ = svc.Get(ctx, "profile-42")
 
-    shardtest.AssertSingleShard(t, fake.LastPlan())
+    fake.AssertSingleShard("FROM profiles")
 }
 ```
 
@@ -568,6 +582,7 @@ Resolved from REQUIREMENTS section 7:
 - Builder: a small fluent builder in its own package `query` (SELECT / INSERT / UPDATE / DELETE).
 - Idempotency table: created explicitly with `DB.EnsureIdempotencyTable` or by the user's migrations (`shard.IdempotencyDDL`), never implicitly at first use.
 - Merge design: the SQL is rewritten once into shard SQL plus a data `Spec`, and a separate `Merge` function combines rows by the Spec (no SQL knowledge), rather than a merger that interprets steps; `Plan` carries no merge steps.
+- Explain: a method on `Querier` that shares `scoped.plan` with Query/Exec (so it returns their errors); merge steps are rendered from the `merge.Spec` itself; per-shard `EXPLAIN` / `EXPLAIN ANALYZE` are options of a configured `Querier.Explainer(opts...)` (`ShardPlans`, `Analyze`) because `Explain` takes `args ...any` and ANALYZE should be visible where it is asked for; ANALYZE always runs in a rolled-back transaction. The fake is a recording `Querier` over `shard.Planner`, not a mock that executes SQL.
 - Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
 - Migrations: wrap `golang-migrate` behind `Migrator`.
 

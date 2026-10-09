@@ -95,8 +95,9 @@ registry.Global("countries")
 
 ### FR-9 Query plan / explain
 - `Explain()` returns the routing decision: target shards, why, strategy (single / multi / all), and merge steps.
-- Optionally includes each shard's Postgres `EXPLAIN` output.
-- Does not execute the query unless `ANALYZE` is requested.
+- Optionally includes each shard's Postgres `EXPLAIN` output (`ShardPlans` option).
+- Does not execute the query unless `ANALYZE` is requested (`Analyze` option); a write measured that way runs in a transaction that is rolled back.
+- Reports the same refusals as running the statement would, so it can be used to check a query before shipping it.
 
 ### FR-10 Migrations
 - Versioned migrations are applied to every shard and tracked per shard in a migrations table.

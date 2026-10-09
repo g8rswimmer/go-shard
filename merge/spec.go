@@ -52,6 +52,9 @@ type Column struct {
 	Key bool
 	// Count is, for Avg, the index of the column holding the per-shard count.
 	Count int
+	// Label is the column as the statement wrote it, such as count(*). It is
+	// only used to describe the merge (Spec.Steps) and may be empty.
+	Label string
 }
 
 // Order is one ORDER BY key.
@@ -65,6 +68,9 @@ type Order struct {
 	// ascending order and first for descending, and the planner has already
 	// applied it.
 	NullsFirst bool
+	// Label is the sort term as the statement wrote it. It is only used to
+	// describe the merge (Spec.Steps) and may be empty.
+	Label string
 }
 
 // Cond is a HAVING condition, evaluated on merged groups.

@@ -222,6 +222,58 @@ func (t *tx) ExecStatement(ctx context.Context, st Statement) (WriteResult, erro
 	return t.exec(ctx, statementRequest(st))
 }
 
+func (t *tx) Explain(ctx context.Context, sql string, args ...any) (Explain, error) {
+	return t.explain(ctx, explainConfig{}, (&scoped{db: t.db}).sqlRequest(sql, args))
+}
+
+func (t *tx) ExplainStatement(ctx context.Context, st Statement) (Explain, error) {
+	return t.explain(ctx, explainConfig{}, statementRequest(st))
+}
+
+func (t *tx) Explainer(opts ...ExplainOption) Explainer {
+	return configured{
+		cfg: newExplainConfig(opts),
+		sql: func(ctx context.Context, cfg explainConfig, sql string, args []any) (Explain, error) {
+			return t.explain(ctx, cfg, (&scoped{db: t.db}).sqlRequest(sql, args))
+		},
+		stmt: func(ctx context.Context, cfg explainConfig, st Statement) (Explain, error) {
+			return t.explain(ctx, cfg, statementRequest(st))
+		},
+	}
+}
+
+// explain checks the statement against the transaction like running it would.
+// Shard plans are read inside the transaction; the Analyze option is refused, since
+// it would run the statement there and could not be undone separately.
+func (t *tx) explain(ctx context.Context, cfg explainConfig, r request) (Explain, error) {
+	p, err := t.plan(r)
+	if err != nil {
+		return Explain{}, err
+	}
+	e, final, err := describePlan(r, p)
+	if err != nil {
+		return Explain{}, err
+	}
+	return t.withShardPlans(ctx, cfg, e, final)
+}
+
+func (t *tx) withShardPlans(ctx context.Context, cfg explainConfig, e Explain, p plan.Plan) (Explain, error) {
+	switch {
+	case cfg.analyze:
+		return Explain{}, fmt.Errorf("%w: the Analyze option runs the statement, and inside a transaction that cannot be undone separately; "+
+			"use the ShardPlans option, or explain outside the transaction", ErrUnsupportedQuery)
+	case !cfg.shardPlans:
+		return e, nil
+	default:
+		text, err := t.t.Explain(ctx, p.SQL, p.Args)
+		if err != nil {
+			return Explain{}, err
+		}
+		e.ShardPlans = map[ShardID]string{t.id: text}
+		return e, nil
+	}
+}
+
 func (t *tx) query(ctx context.Context, r request) (Rows, error) {
 	p, err := t.plan(r)
 	if err != nil {
@@ -314,4 +366,34 @@ func (u uncheckedTx) Exec(ctx context.Context, sql string, args ...any) (WriteRe
 
 func (u uncheckedTx) ExecStatement(ctx context.Context, st Statement) (WriteResult, error) {
 	return u.Exec(ctx, st.SQL(), st.Args()...)
+}
+
+func (u uncheckedTx) Explain(ctx context.Context, sql string, args ...any) (Explain, error) {
+	return u.explain(ctx, explainConfig{}, plan.Plan{SQL: sql, Args: args})
+}
+
+func (u uncheckedTx) ExplainStatement(ctx context.Context, st Statement) (Explain, error) {
+	return u.explain(ctx, explainConfig{}, plan.Plan{SQL: st.SQL(), Args: st.Args()})
+}
+
+func (u uncheckedTx) Explainer(opts ...ExplainOption) Explainer {
+	return configured{
+		cfg: newExplainConfig(opts),
+		sql: func(ctx context.Context, cfg explainConfig, sql string, args []any) (Explain, error) {
+			return u.explain(ctx, cfg, plan.Plan{SQL: sql, Args: args})
+		},
+		stmt: func(ctx context.Context, cfg explainConfig, st Statement) (Explain, error) {
+			return u.explain(ctx, cfg, plan.Plan{SQL: st.SQL(), Args: st.Args()})
+		},
+	}
+}
+
+func (u uncheckedTx) explain(ctx context.Context, cfg explainConfig, p plan.Plan) (Explain, error) {
+	p.Targets, p.Strategy = []ShardID{u.t.id}, plan.Single
+	p.Reason = fmt.Sprintf("tx.Unchecked(): the transaction's shard %s, not routed", u.t.id)
+	e, final, err := describePlan(request{}, p)
+	if err != nil {
+		return Explain{}, err
+	}
+	return u.t.withShardPlans(ctx, cfg, e, final)
 }
