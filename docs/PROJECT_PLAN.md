@@ -173,8 +173,8 @@ Every milestone:
 
 Release checklist for v0.1.0:
 
-- [ ] All FR-1 to FR-14 have passing tests (traceability table in ARCHITECTURE section 10).
-- [ ] Property test passes for the supported merge subset.
+- [x] All FR-1 to FR-14 have passing tests (traceability table in ARCHITECTURE section 10, with the test files).
+- [x] Property test passes for the supported merge subset (`fanout_property_integration_test.go`).
 - [x] Failure-injection tests pass; no goroutine leaks (M10).
 - [x] Every example runs in CI against real Postgres (M10, `TestExamplesRun`).
 - [ ] README quick start works on a clean machine.

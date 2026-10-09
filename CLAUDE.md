@@ -25,6 +25,8 @@ make test-integration  # integration tests, build tag `integration`
 make down              # stop the shards and delete their data
 make bench             # benchmarks (BENCHTIME=1x for a quick check); bench-integration needs make up
 make examples          # run every example against the make up shards
+make demo-setup        # shards + migrations + demo dataset (docs/DEMO.md); demo-reset starts over
+make demo-check        # run docs/DEMO.md and compare its output; needs Docker
 ```
 
 `make vet lint test` must pass before a change is done. Go 1.26+, PostgreSQL 14+.

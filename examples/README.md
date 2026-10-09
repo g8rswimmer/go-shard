@@ -22,6 +22,8 @@ against databases you can afford to experiment on.
 | [migrations](migrations) | Apply to every shard, status, drift, a migration that fails on one shard |
 | [explain](explain) | Reading `Explain` output for single, multi and all-shard statements |
 | [observability](observability) | Logs, OpenTelemetry spans and metrics, health and pool statistics |
+| [adopt](adopt) | Move an existing database into shards: ordered, re-runnable load, then verify counts, placement and colocation ([guide](../docs/ADOPTING.md)) |
+| [demo](demo) | The commands behind the [demo guide](../docs/DEMO.md): one per scenario, with `make demo-setup` |
 | [testing](testing) | Unit testing with `shardtest.NewFake` (no Docker) and with a real cluster |
 
 CI runs every example against real PostgreSQL and checks that it exits
