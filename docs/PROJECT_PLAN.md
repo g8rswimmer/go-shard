@@ -86,9 +86,10 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** the property test passes for the supported subset, and memory use during a merge is flat with respect to result size up to `MaxMergeRows`.
 
 ### M7 Explain (S) - FR-9
-- `Plan` rendering: strategy, targets, reason, merge steps, rewritten shard SQL.
-- Optional per-shard Postgres `EXPLAIN`; `ANALYZE` opt-in.
-- `shardtest.NewFake` and assertions (`AssertRoutes`, `AssertSingleShard`, `AssertFanout`, `LastPlan`).
+- `Explain` / `ExplainStatement` on `Querier` (so also on `Tx` and the `With...` handles): `Explain` value with strategy, targets, reason, shard SQL (per shard for a split INSERT), insert rows and merge steps (rendered from `merge.Spec`, via `Column.Label` / `Order.Label`); `String()` for people. It shares routing with Query/Exec, so it returns the same errors.
+- Per-shard PostgreSQL `EXPLAIN` with `Explainer(shard.ShardPlans())`; `Explainer(shard.Analyze())` runs the statement in a transaction that is rolled back (`Executor.ExplainShards`). Refused inside a transaction.
+- `shard.Planner`: routing and Explain with no connections. `merge.Scan` into `**T` (nullable columns), as `database/sql` allows.
+- `shardtest.NewFake` (recording `Querier` over the planner, stubs for rows, rows affected and errors) and assertions `AssertRoutes`, `AssertSingleShard`, `AssertFanout`, `LastPlan`.
 - `examples/explain`, `examples/testing`.
 - **Done when:** golden-file tests for Explain output of single, multi and all-shard queries, and the unit-test example runs without Docker.
 

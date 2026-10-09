@@ -5,6 +5,7 @@ package pgparse
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -203,7 +204,7 @@ func TestPlanMerge(t *testing.T) {
 			if p.SQL != tc.wantSQL {
 				t.Errorf("shard SQL:\n got  %s\n want %s", p.SQL, tc.wantSQL)
 			}
-			got := p.Spec
+			got := stripLabels(p.Spec)
 			if tc.want.Columns == nil && got.Columns != nil {
 				t.Errorf("Columns = %v, want none (select *-safe)", got.Columns)
 			}
@@ -275,4 +276,68 @@ func TestPlanMergeRejects(t *testing.T) {
 			t.Error("expected an error")
 		}
 	})
+}
+
+// stripLabels clears the descriptive labels, which the golden specs above do
+// not repeat; TestPlanMergeLabels covers them.
+func stripLabels(s merge.Spec) merge.Spec {
+	s.Columns = slices.Clone(s.Columns)
+	for i := range s.Columns {
+		s.Columns[i].Label = ""
+	}
+	s.Order = slices.Clone(s.Order)
+	for i := range s.Order {
+		s.Order[i].Label = ""
+	}
+	return s
+}
+
+func TestPlanMergeLabels(t *testing.T) {
+	tests := []struct {
+		name  string
+		sql   string
+		steps []string
+	}{
+		{
+			"ordered merge with limit",
+			"SELECT id, name FROM profiles ORDER BY created_at DESC, id LIMIT 20 OFFSET 40",
+			[]string{"OrderedMerge(created_at DESC, id)", "Offset(40)", "Limit(20)", "DropHidden(1)"},
+		},
+		{
+			"no order",
+			"SELECT id FROM profiles",
+			[]string{"Concatenate(in shard order)"},
+		},
+		{
+			"ordinal and alias read as the column",
+			"SELECT team, count(*) AS n FROM players GROUP BY team ORDER BY 2 DESC, team",
+			[]string{"Aggregate(by team: count(*) = sum of counts)", "Sort(count(*) DESC, team)"},
+		},
+		{
+			"avg, having and not",
+			"SELECT team, avg(score) FROM players GROUP BY team HAVING avg(score) > 3 AND NOT count(*) < 2 ORDER BY 1",
+			[]string{"Aggregate(by team: avg(score) = sum / count, count(*) = sum of counts)", "Having(avg(score) > 3 AND NOT (count(*) < 2))", "Sort(team)", "DropHidden(4)"},
+		},
+		{
+			"distinct",
+			"SELECT DISTINCT team FROM players ORDER BY team",
+			[]string{"OrderedMerge(team)", "Distinct"},
+		},
+		{
+			"nulls placement is only mentioned when it is not the default",
+			"SELECT id FROM profiles ORDER BY id NULLS FIRST, name DESC NULLS LAST",
+			[]string{"OrderedMerge(id NULLS FIRST, name DESC NULLS LAST)", "DropHidden(1)"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := New().PlanMerge(tc.sql, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := p.Spec.Steps(); !slices.Equal(got, tc.steps) {
+				t.Errorf("steps:\n got  %q\n want %q", got, tc.steps)
+			}
+		})
+	}
 }

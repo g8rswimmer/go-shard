@@ -1,0 +1,11 @@
+op:        SELECT
+strategy:  all
+targets:   shard-01, shard-02, shard-03
+reason:    WithAllShards()
+shard sql: SELECT country, count(*) AS n, sum(age) AS avg, count(age), count(*) FROM profiles GROUP BY country
+merge:
+  1. Aggregate(by country: count(*) = sum of counts, avg(age) = sum / count)
+  2. Having(count(*) > 10)
+  3. Sort(count(*) DESC, country)
+  4. Limit(5)
+  5. DropHidden(2)

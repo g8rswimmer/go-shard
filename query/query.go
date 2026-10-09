@@ -303,7 +303,7 @@ func (b *SelectBuilder) Build() (Statement, error) {
 			}
 			s.analysis.OrderBy = append(s.analysis.OrderBy, t)
 
-			mo := merge.Order{Desc: o.dir == Desc, NullsFirst: o.dir == Desc}
+			mo := merge.Order{Desc: o.dir == Desc, NullsFirst: o.dir == Desc, Label: o.col}
 			switch at := slices.Index(b.cols, o.col); {
 			case at >= 0:
 				mo.Col = at

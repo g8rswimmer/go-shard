@@ -19,6 +19,9 @@ limit, offset) without the parser. Raw SQL that runs on several shards, and any
 `GROUP BY` or aggregate, needs the parser (or an analyzer that also implements
 `merge.Planner`, below).
 
+`Explain` and `shardtest.NewFake` follow the same rule: they route built
+statements and explicit `With...` routes without the parser, and raw SQL needs it.
+
 ## Requirements
 
 - A C compiler on the build machine (`gcc` or `clang`). On macOS this comes with

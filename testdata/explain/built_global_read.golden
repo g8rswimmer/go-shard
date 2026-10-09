@@ -1,0 +1,5 @@
+op:        SELECT
+strategy:  single
+targets:   shard-01
+reason:    only global tables (or none) are read: every shard can answer
+shard sql: SELECT * FROM "countries" WHERE "code" = $1

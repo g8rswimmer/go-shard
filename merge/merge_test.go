@@ -535,7 +535,18 @@ func TestScan(t *testing.T) {
 	if err := assign(a, int64(1)); err == nil {
 		t.Error("non-pointer destination should fail")
 	}
-	_ = ep
+	// A pointer to a pointer is how database/sql scans a nullable column.
+	ep = &s
+	if err := assign(&ep, nil); err != nil || ep != nil {
+		t.Errorf("NULL into **string = %v, %v; want a nil pointer", ep, err)
+	}
+	if err := assign(&ep, int64(9)); err != nil || ep == nil || *ep != "9" {
+		t.Errorf("value into **string = %v, %v; want a pointer to 9", ep, err)
+	}
+	var ip *int
+	if err := assign(&ip, "x"); err == nil {
+		t.Error("a bad value into **int should fail")
+	}
 }
 
 // A merge must not hold the result in memory: serving millions of rows from

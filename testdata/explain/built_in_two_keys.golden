@@ -1,0 +1,8 @@
+op:        SELECT
+strategy:  multi
+targets:   shard-02, shard-03
+reason:    routed by key: profiles.id has 5 key value(s) -> [shard-02 shard-03]
+shard sql: SELECT *, "name" FROM "profiles" WHERE "id" IN ($1, $2, $3, $4, $5) ORDER BY "name"
+merge:
+  1. OrderedMerge(name)
+  2. DropHidden(1)

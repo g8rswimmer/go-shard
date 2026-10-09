@@ -1,0 +1,5 @@
+op:        UPDATE
+strategy:  single
+targets:   shard-03
+reason:    WithShardKey(7): bucket 841 belongs to shard-03
+shard sql: UPDATE profiles SET name = 'x' WHERE id = 7

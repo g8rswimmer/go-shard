@@ -68,7 +68,11 @@ type Config struct {
 
 // validate checks the config and builds the router. The error wraps
 // ErrInvalidConfig and lists every problem found.
-func (c Config) validate() (*router.HashRouter, error) {
+func (c Config) validate() (*router.HashRouter, error) { return c.validateShape(true) }
+
+// validateShape is validate, where needDSN says whether shards must have a
+// connection string (a Planner connects to nothing).
+func (c Config) validateShape(needDSN bool) (*router.HashRouter, error) {
 	var problems []string
 	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
@@ -102,7 +106,7 @@ func (c Config) validate() (*router.HashRouter, error) {
 		default:
 			seen[s.ID] = true
 		}
-		if s.DSN == "" {
+		if needDSN && s.DSN == "" {
 			add("shard %q has no DSN", s.ID)
 		}
 		if s.MaxConns < 0 {

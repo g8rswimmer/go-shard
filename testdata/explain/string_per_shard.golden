@@ -1,0 +1,15 @@
+op:        INSERT
+strategy:  multi
+targets:   a, b
+reason:    rows belong to a and b
+shard sql:
+  a: INSERT ... ($1), ($2)
+  b: INSERT ... ($1)
+rows:
+  a: 0, 2
+  b: 1
+note: careful
+shard plans:
+  a:
+    Insert on profiles
+      -> Result
