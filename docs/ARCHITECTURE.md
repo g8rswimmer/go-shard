@@ -62,7 +62,8 @@ Dependency direction (arrows mean "imports"). Nothing imports the facade, and on
 shard -> plan, exec, merge, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
 plan -> router, registry, analyze
 query -> analyze
-exec, merge, migrate -> (types from plan/registry only)
+exec, merge -> (types from plan/registry only)
+migrate -> router (ShardID), golang-migrate
 analyze -> registry
 analyze/pgparse -> cgo (pg_query_go)
 ```
@@ -385,13 +386,20 @@ type Explain struct {
 
 ### 5.9 Migrations (FR-10)
 
-- `migrate.Runner` opens one `golang-migrate` instance per shard, all pointed at the same migration source.
-- Version is tracked per shard in `schema_migrations`. A Postgres advisory lock per shard prevents concurrent runs.
-- **Apply:** runs shards in parallel (bounded). Policy `HaltOnFailure` (default; stops scheduling new shards after the first failure) or `ContinueOnFailure`.
-- **Status:** returns `map[ShardID]Version` and flags drift when versions differ.
-- A failed shard is left at its last good version and is re-runnable.
-- Global tables are covered by running the same migration on every shard. The runner treats global-table data changes like any other migration.
-- Implementation sits behind a `Migrator` interface so goose could replace golang-migrate.
+```go
+runner, _ := db.Migrations(migrate.FromURL("file://./migrations"))   // or migrate.New(shards, src, opts...)
+res, err := runner.Up(ctx)        // every shard to the newest version
+st, err := runner.Status(ctx)     // per-shard version; st.Drift(), st.Behind(), st.Dirty()
+```
+
+- **Engine.** `migrate.Runner` holds the shard list, the source and the options, and is immutable. Each operation opens one `Migrator` per shard (default: golang-migrate over its own pgx connection, behind the `Migrator` interface so goose could replace it), and closes it before returning. The source is a golang-migrate URL (`file://...`) or an `fs.FS` (`FromFS`, for `embed`).
+- **Where the version lives.** In `schema_migrations` on each shard (`WithTable` renames it). golang-migrate holds a PostgreSQL advisory lock on the shard for the whole run, so concurrent runners, or processes, take turns; one that waited finds nothing left to do and succeeds.
+- **Apply.** `Up` / `UpTo(version)` run shards in parallel, at most `WithConcurrency` (default 4) at a time. Forward-only: `.down.sql` files are not used. Policy `HaltOnFailure` (default) stops *starting* shards after the first failure (those already running finish; the rest are `Skipped`), `ContinueOnFailure` migrates every shard it can. The `Result` always lists every shard (`Before`, `After`, `Err`, `Skipped`); the error wraps `ErrFailed` and one `*ShardError` per failed shard.
+- **A failed shard stays at its last good version.** golang-migrate marks a migration dirty before it runs and leaves it dirty on failure. A migration file is sent as one statement batch, which PostgreSQL runs as a single transaction, so a failure leaves nothing behind (an integration test checks that the first statement of a failing file is gone). The Migrator contract is therefore that after a failed `UpTo` the shard is clean at the version before the failure, and the golang-migrate Migrator puts it back there; the next `Up` retries. The exception is a statement that cannot run in a transaction (`CREATE INDEX CONCURRENTLY`): keep it alone in its file.
+- **Dirty from a crash.** If the process dies mid-migration the shard really is dirty and its state is unknown. `Up` refuses it, `Status` lists it in `Dirty()`, and `Runner.Force(ctx, shard, version)` records the version you have verified by hand.
+- **Status and drift.** `Status` reads every shard (in parallel) and the newest version in the source. `Drift()` is true when shards are not all in the same state (including never migrated vs migrated), when any is dirty, or when one cannot be read. `Behind()` lists shards short of the newest migration (a cluster that is uniformly behind is not drifting). An unreadable shard is in `Unreadable()` and the error names it.
+- **Sharded, colocated and global tables** are covered because every shard gets the same files; a migration that loads global-table data is like any other.
+- **Wiring.** `DB.Migrations(src, opts...)` uses the DSNs in `Config`; `shardtest.WithMigrations(url)` / `WithMigrationsFS` apply migrations as `NewCluster` starts, and `cluster.Migrator(t, src)` returns a Runner for step-by-step tests.
 
 ### 5.10 Observability (FR-11)
 
@@ -433,7 +441,7 @@ db.WithAllShards().Exec(ctx, "CREATE TABLE ...")                      // every s
 
 | Tool | Use |
 |---|---|
-| `shardtest.NewCluster(t, n, opts...)` | Starts `n` Postgres containers in parallel (testcontainers; image from `WithPostgresVersion`, `SHARDTEST_POSTGRES_VERSION`, default 14) named `shard-01`..., and registers cleanup with `t.Cleanup`. Applying migrations (`WithMigrations`) arrives with M8. If `SHARDTEST_DSNS` is set, it uses those instances instead and **drops and recreates their `public` schema** at the start of each test; tests sharing them must run with `go test -p 1`. |
+| `shardtest.NewCluster(t, n, opts...)` | With `WithMigrations(url)` / `WithMigrationsFS(fsys, dir)` it applies the migrations to every shard before returning (a failure fails the test); `cluster.Migrator(t, src, opts...)` returns the `migrate.Runner` for the cluster. Starts `n` Postgres containers in parallel (testcontainers; image from `WithPostgresVersion`, `SHARDTEST_POSTGRES_VERSION`, default 14) named `shard-01`..., and registers cleanup with `t.Cleanup`. If `SHARDTEST_DSNS` is set, it uses those instances instead and **drops and recreates their `public` schema** at the start of each test; tests sharing them must run with `go test -p 1`. |
 | Cluster helpers (M2) | `cluster.Open(t, reg)` opens a `*shard.DB` and closes it at cleanup; `Config(reg)`; `IDs()`; `DSN(id)`; `ExecAll(t, sql)` runs DDL on every shard; `Direct(t, id)` returns a plain `*sql.DB` that bypasses go-shard, so a test can assert where a row physically is; `Count(t, id, sql)`; `Stop(t, id)` shuts a container down to test a real outage (it skips the test when the cluster uses `SHARDTEST_DSNS`); `Seed(t, db, table, rows...)` inserts each row on the shard that owns it (global tables on every shard). |
 | `shardtest.NewFake(t, reg, shards...)` | A `Querier` that needs no database. It routes every statement with the real registry, router and analyzer (through `shard.Planner`), **records** it with its `Explain`, and answers with what you stub: `StubRows(match, columns, rows...)`, `StubAffected(match, n)` (per target shard), `StubError(match, err)`. `match` is a substring of the SQL; the last matching stub wins. It also provides `WithShardKey` / `WithShard` / `WithAllShards`. It does not run SQL, keep data, merge, or fake transactions. |
 | Fake assertions (methods on the fake, failing the `testing.TB` it was built with) | `AssertRoutes(match, shards...)` (exactly these shards, any order), `AssertSingleShard(match) ShardID`, `AssertFanout(match, shards...)`, `LastPlan() shard.Explain`, `Calls()` (kind, SQL, args, plan, routing error) and `Reset()`. They look at the most recent statement whose SQL contains `match`, and fail with the SQL seen when none does or when it was refused. |
@@ -584,7 +592,7 @@ Resolved from REQUIREMENTS section 7:
 - Merge design: the SQL is rewritten once into shard SQL plus a data `Spec`, and a separate `Merge` function combines rows by the Spec (no SQL knowledge), rather than a merger that interprets steps; `Plan` carries no merge steps.
 - Explain: a method on `Querier` that shares `scoped.plan` with Query/Exec (so it returns their errors); merge steps are rendered from the `merge.Spec` itself; per-shard `EXPLAIN` / `EXPLAIN ANALYZE` are options of a configured `Querier.Explainer(opts...)` (`ShardPlans`, `Analyze`) because `Explain` takes `args ...any` and ANALYZE should be visible where it is asked for; ANALYZE always runs in a rolled-back transaction. The fake is a recording `Querier` over `shard.Planner`, not a mock that executes SQL.
 - Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
-- Migrations: wrap `golang-migrate` behind `Migrator`.
+- Migrations: wrap `golang-migrate` behind `Migrator`; forward-only; a failed shard is reset to its last good version (migrations are single transactions); a runner opens connections per operation rather than holding them.
 
 Still open (decide in the project plan or early implementation):
 

@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/g8rswimmer/go-shard"
+	"github.com/g8rswimmer/go-shard/migrate"
 	"github.com/g8rswimmer/go-shard/registry"
 )
 
@@ -53,13 +55,27 @@ const (
 type Option func(*options)
 
 type options struct {
-	pgVersion string
+	pgVersion  string
+	migrations *migrate.Source
 }
 
 // WithPostgresVersion sets the PostgreSQL image tag for containers. The default
 // is SHARDTEST_POSTGRES_VERSION, or DefaultPostgresVersion if that is unset.
 // It has no effect when SHARDTEST_DSNS is set.
 func WithPostgresVersion(v string) Option { return func(o *options) { o.pgVersion = v } }
+
+// WithMigrations applies the migrations at a golang-migrate source URL (for
+// example "file://./migrations") to every shard before NewCluster returns, so
+// the test starts with the schema in place. A failure fails the test.
+func WithMigrations(url string) Option {
+	return func(o *options) { src := migrate.FromURL(url); o.migrations = &src }
+}
+
+// WithMigrationsFS is WithMigrations for migrations in dir inside fsys, such as
+// an embed.FS.
+func WithMigrationsFS(fsys fs.FS, dir string) Option {
+	return func(o *options) { src := migrate.FromFS(fsys, dir); o.migrations = &src }
+}
 
 // Cluster is a set of empty PostgreSQL shards for one test.
 type Cluster struct {
@@ -126,7 +142,28 @@ func NewCluster(t testing.TB, n int, opts ...Option) *Cluster {
 			}
 		}
 	}
+	if o.migrations != nil {
+		res, err := c.Migrator(t, *o.migrations).Up(ctx)
+		if err != nil {
+			t.Fatalf("shardtest: applying migrations: %v\n%+v", err, res)
+		}
+	}
 	return c
+}
+
+// Migrator returns a migrate.Runner for the shards, to apply migrations in a
+// test step by step or to check Status and drift.
+func (c *Cluster) Migrator(t testing.TB, src migrate.Source, opts ...migrate.Option) *migrate.Runner {
+	t.Helper()
+	shards := make([]migrate.Shard, len(c.ids))
+	for i, id := range c.ids {
+		shards[i] = migrate.Shard{ID: id, DSN: c.dsns[id]}
+	}
+	r, err := migrate.New(shards, src, opts...)
+	if err != nil {
+		t.Fatalf("shardtest: %v", err)
+	}
+	return r
 }
 
 // externalDSNs parses SHARDTEST_DSNS and returns the first n entries.

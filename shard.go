@@ -37,6 +37,12 @@
 //
 //	e, err := db.Explain(ctx, "SELECT name FROM profiles WHERE id = $1", id)
 //	fmt.Println(e) // strategy, targets, reason, shard SQL, merge steps
+//
+// Migrations returns a migrate.Runner for the configured shards, which applies
+// the same versioned migrations to every shard and reports drift.
+//
+//	runner, err := db.Migrations(migrate.FromURL("file://./migrations"))
+//	res, err := runner.Up(ctx)
 package shard
 
 import (
@@ -45,6 +51,7 @@ import (
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
+	"github.com/g8rswimmer/go-shard/migrate"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -59,6 +66,7 @@ type DB struct {
 	idemTable string           // where idempotency keys are recorded
 	maxMerge  int              // rows or groups a merge may hold
 	next      atomic.Uint64    // spreads statements any shard can answer
+	shards    []migrate.Shard  // for Migrations
 }
 
 var _ Querier = (*DB)(nil)
@@ -103,7 +111,12 @@ func newDB(cfg Config, r *router.HashRouter, pool *exec.Pool, ex *exec.Executor)
 	if maxMerge == 0 {
 		maxMerge = defaultMaxMergeRows
 	}
+	shards := make([]migrate.Shard, len(cfg.Shards))
+	for i, sc := range cfg.Shards {
+		shards[i] = migrate.Shard{ID: sc.ID, DSN: sc.DSN}
+	}
 	return &DB{
+		shards:    shards,
 		idemTable: idemTable,
 		maxMerge:  maxMerge,
 		registry:  cfg.Registry,

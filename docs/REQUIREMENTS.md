@@ -104,6 +104,7 @@ registry.Global("countries")
 - Reports per-shard status and detects drift (shards at different versions).
 - A failed shard is reported and re-runnable (idempotent). Policy is defined for halt-on-first-failure vs continue.
 - Covers both sharded-table DDL and global-table data.
+- Forward-only (no down migrations). Concurrent runs against a shard take turns. A migration is atomic, so a failed shard stays at its last good version; a shard a crash left dirty is reported and can be repaired explicitly.
 
 ### FR-11 Observability and health
 - Per-shard health and pool stats, structured logging, and tracing/metrics hooks (OpenTelemetry-friendly).
