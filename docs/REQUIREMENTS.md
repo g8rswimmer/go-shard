@@ -162,7 +162,7 @@ registry.Global("countries")
 - **Shard-key hygiene:** immutable keys; key type normalization so int/uuid/string hashing is stable across restarts and versions.
 - **ID generation:** globally unique IDs that embed or hash to the shard (e.g. UUIDv7 or snowflake) so inserts can be routed.
 - **Unique constraints:** uniqueness is only enforced per shard unless the unique column includes the shard key. Document this and validate in the registry.
-- **Retry/timeout policy:** per-shard timeouts, and safe retries for idempotent reads only.
+- **Retry/timeout policy:** per-shard timeouts. The library does not retry; reads are safe for the caller to retry and writes are retried safely with an idempotency key (decided in M10, see docs/OPERATIONS.md).
 - **Read replicas:** deferred; leave a seam in the shard config.
 - **Config:** loadable from struct/env/file; secrets are not logged.
 

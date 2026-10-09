@@ -18,14 +18,16 @@ const (
 	// Sum adds the per-shard sums. A shard with no rows sums to NULL, which is
 	// ignored.
 	Sum
-	// Min and Max pick the smallest or largest value, ignoring NULL.
+	// Min picks the smallest value, ignoring NULL.
 	Min
+	// Max picks the largest value, ignoring NULL.
 	Max
 	// Avg is a per-shard SUM that becomes sum / count at the end. Column.Count
 	// is the column that holds the per-shard COUNT.
 	Avg
 )
 
+// String names the function: pass, count, sum, min, max or avg.
 func (f Func) String() string {
 	switch f {
 	case Pass:

@@ -18,7 +18,7 @@ import (
 	"github.com/g8rswimmer/go-shard/shardtest"
 )
 
-func txRegistry(t *testing.T) *registry.Registry {
+func txRegistry(t testing.TB) *registry.Registry {
 	t.Helper()
 	reg, err := registry.New(
 		registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt)),

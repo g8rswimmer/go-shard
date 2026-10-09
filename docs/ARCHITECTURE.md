@@ -256,7 +256,7 @@ Two producers of `Analysis`, one consumer (`plan.Route`):
   - Each subquery gets its own query level (found by walking the whole expression tree, so a subquery inside a `CASE`, a function argument or a select list is not missed).
   - Constants in the `ON` of an outer join are recorded as notes, not bindings.
   - Statements it cannot route safely return `ErrUnsupportedQuery` naming the construct.
-- Parsing is per call and not cached. A cache keyed by SQL text is a straightforward later optimisation.
+- Parsing is per call and not cached, and costs about 100 µs a call, twenty times the rest of the library's work on a call (docs/BENCHMARKS.md). A cache keyed by SQL text is a straightforward later optimisation; until then hot paths should use built statements or an explicit route.
 - Only `analyze/pgparse` needs cgo. Without cgo the package is empty, `Config.Analyzer` defaults to none, and raw SQL needs an explicit route (see docs/BUILDING.md). `Config.Analyzer` accepts any `analyze.Analyzer`.
 - `WithShardKey`, `WithShard` and `WithAllShards` bypass analysis completely and are recorded in `Plan.Reason`. They are the escape hatch, so the caller is trusted.
 
@@ -265,14 +265,15 @@ Two producers of `Analysis`, one consumer (`plan.Route`):
 - `exec.Pool` holds one `*sql.DB` (pgx stdlib driver) per shard with its own `MaxConns` (default 10). `exec.Open` connects and pings every shard; if any fails it closes the rest and returns a `*ShardError` naming the shard. DSNs never appear in errors.
 - The pool depends on a small `Conn` interface (the subset of `*sql.DB` it uses), so the executor is unit tested with a fake `database/sql` driver and no database.
 - `Executor.Query` and `Executor.Exec` run a `plan.Plan` on every target in parallel through an `errgroup` limited to `MaxFanout` (default 8), so a wide statement cannot open unbounded work. Plans with no targets, unknown shards or repeated shards are rejected before anything runs.
-- Each shard call gets its own context with the per-shard timeout (if any), derived from the caller's context. The timeout covers streaming the rows too, so `exec.Rows` releases the context on `Close`: rows must always be closed.
+- Each shard call gets its own context with the per-shard timeout (if any), derived from the caller's context. `exec.Rows` releases the context on `Close`: rows must always be closed.
+- **The shard timeout of a query has two budgets** (found by failure injection, `exec/timeout.go`). The context is a `pushable`: it ends with `DeadlineExceeded` after the timeout, but its clock can be paused and restarted. A shard's clock is paused when its query returns, and every shard's clock is restarted when the last shard has answered (or failed). Otherwise a slow shard that fails after exactly the timeout would expire the rows of the shards that had answered, and `AllowPartial` could never return their rows. Total time is bounded by twice the timeout. Writes and transaction statements keep a plain deadline.
 - **Reads fail fast** (first error cancels the other shards' queries and closes any result sets already open). The cancellation is wired with `context.AfterFunc` and removed once each query returns, so cancelling on exit never cuts off rows the caller is still reading. A test pins this.
 - **Writes do not fail fast.** Every target is attempted and each outcome is reported, because a write that succeeded on some shards must be visible. The facade turns the outcomes into a `WriteResult` plus an error if any shard failed.
 - A plan may give each shard its own statement (`Plan.PerShard`, read through `Plan.StatementFor`): this is how a multi-row INSERT sends every shard only its rows. `ShardExec` also reports the VALUES rows the shard received and whether the write was a replay.
 - `Executor.ExecIdempotent` runs the same fan-out with the idempotency protocol of 5.6.
 - `Executor.Begin` returns an `exec.Tx`: one shard, one `*sql.Tx`, one connection, with `Query` / `Exec` / `Commit` / `Rollback` (5.7).
 - `Executor.QueryPartial` is `Query` that does not fail fast: every target is attempted, the shards that could not start their query are returned as `[]*ShardError` next to the rows of those that could, and it fails only when no shard answered or the context ended. A failure while a shard streams is not tolerated; it stops the iteration (5.5).
-- Reads can be retried once on connection errors; this is not implemented yet. Writes are never retried by the library: a retry is the caller's, made safe by an idempotency key (5.6).
+- **No retries.** Neither reads nor writes are retried by the library (decided in M10): a retry that quietly hides a shard failure is the caller's call. Reads are safe for the caller to retry; writes are retried safely with an idempotency key (5.6). The failure-injection tests showed the one case a library retry would help, a dead idle connection that fails the first statement after a failover; the error arrives from the server as a normal PostgreSQL error, which cannot be told apart from other failures without risking a repeated side effect.
 - Rows are streamed per shard so the merger can start before all shards finish.
 
 ### 5.5 Merger (FR-5)
@@ -565,7 +566,9 @@ Sentinel errors, wrapped with context, usable with `errors.Is`:
 |---|---|---|
 | Unit | Registry validation, key canonicalization vectors, bucket map validation, predicate analysis, merge steps, plan rendering | No DB; table-driven tests; fake `Executor` returns canned `ShardRows` |
 | Integration | Routing and fan-out, ordered merge, writes with partial failure, single-shard tx, migrations and drift | 3 real Postgres containers via `shardtest.NewCluster` (the same public package users get); one container is stopped to test failures |
-| Examples | Every example builds and runs | CI builds `./examples/...`; an integration job runs each against real Postgres (5.12) |
+| Failure injection | A slow, stopped, disconnected or abandoned shard; cancellation mid-merge; no goroutine leaks | `failure_integration_test.go` against real shards (locks, `pg_terminate_backend`, stopping a container), each ending with a `goleak` check; unit-test packages run under `goleak.VerifyTestMain`; `exec/timeout_test.go` for the timeout clock |
+| Benchmarks | Routing overhead and merge throughput | `make bench` (in-process fakes), `make bench-integration` (real PostgreSQL); one iteration of each in CI; numbers in docs/BENCHMARKS.md |
+| Examples | Every example builds and runs | CI builds `./examples/...`; `TestExamplesRun` (integration) runs each against real Postgres and checks its exit code and key output lines (5.12) |
 | Property | Merge equals running the same query on a single combined database | `TestFanOutMatchesOneDatabase`: identical rows in 1 DB (a private schema on shard 1) and in 3 shards; 600 generated queries per run (rows, `DISTINCT`, aggregates, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, colocated joins); a total order is compared row for row, otherwise as a set plus an in-order check. `FANOUT_SEED` and `FANOUT_QUERIES` explore further |
 | Compatibility | Postgres 14 and the newest supported release; Go 1.26 | CI matrix |
 
@@ -617,4 +620,4 @@ Resolved from REQUIREMENTS section 7:
 
 Still open (decide in the project plan or early implementation):
 
-- Typed repositories on top of the builder (the fluent builder itself is done in M3).
+- Typed repositories on top of the builder: not in v0.x. The fluent builder stays the API (decided in M10); a repository layer can be built on `Querier` by users or added later without changing it.

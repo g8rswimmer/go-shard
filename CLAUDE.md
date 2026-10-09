@@ -23,6 +23,8 @@ make vet lint          # go vet and golangci-lint
 make up                # 3 local Postgres shards on ports 5441-5443 (needs Docker)
 make test-integration  # integration tests, build tag `integration`
 make down              # stop the shards and delete their data
+make bench             # benchmarks (BENCHTIME=1x for a quick check); bench-integration needs make up
+make examples          # run every example against the make up shards
 ```
 
 `make vet lint test` must pass before a change is done. Go 1.26+, PostgreSQL 14+.
@@ -63,6 +65,8 @@ buildable with `CGO_ENABLED=0`: files that need the parser carry
 - The routing rules are pinned by a table of real SQL statements in
   `plan/route_suite_test.go`. Add a case there for every new rule or bug. When
   changing a safety rule, mutate it and check a test fails.
+- Unit-test packages run under `goleak` (`leak_test.go`): a test must not leave goroutines behind. Failure-injection tests are in `failure_integration_test.go`.
+- Every exported symbol has a doc comment; the linter enforces it.
 - Fixed test vectors (for example router bucket numbers) pin behavior that must never change. If one fails, fix the code, not the vector.
 
 ## Workflow

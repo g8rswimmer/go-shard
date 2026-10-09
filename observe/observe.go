@@ -21,6 +21,7 @@ const (
 	Exec
 )
 
+// String returns "query" or "exec".
 func (k Kind) String() string {
 	switch k {
 	case Query:
@@ -109,14 +110,19 @@ type Nop struct{}
 
 var _ Hooks = Nop{}
 
+// OnPlan does nothing and returns ctx.
 func (Nop) OnPlan(ctx context.Context, _ PlanEvent) context.Context { return ctx }
 
+// OnShardStart does nothing and returns ctx.
 func (Nop) OnShardStart(ctx context.Context, _ ShardStartEvent) context.Context { return ctx }
 
+// OnShardDone does nothing.
 func (Nop) OnShardDone(context.Context, ShardDoneEvent) {}
 
+// OnMerge does nothing.
 func (Nop) OnMerge(context.Context, MergeEvent) {}
 
+// OnDone does nothing.
 func (Nop) OnDone(context.Context, DoneEvent) {}
 
 // Multi calls several Hooks in turn, for example Slog and the OpenTelemetry

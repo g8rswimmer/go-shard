@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"testing"
@@ -606,4 +607,33 @@ func TestFuncString(t *testing.T) {
 		}
 	}
 	_ = fmt.Sprint
+}
+
+// The int64 and float64 fast paths of compare must order exactly as the exact
+// (big.Rat) comparison does, including at the extremes.
+func TestCompareFastPathsAgreeWithExactComparison(t *testing.T) {
+	exact := func(a, b any) int { return toRat(a).Cmp(toRat(b)) }
+	ints := []any{int64(math.MinInt64), int64(-1), int64(0), int64(1), int64(math.MaxInt64), int64(math.MaxInt64 - 1)}
+	floats := []any{math.SmallestNonzeroFloat64, -0.5, 0.0, 0.5, 1e300, -1e300, math.MaxFloat64}
+	for name, vals := range map[string][]any{"int64": ints, "float64": floats} {
+		for _, a := range vals {
+			for _, b := range vals {
+				got, err := compare(a, b, false)
+				if err != nil || got != exact(a, b) {
+					t.Errorf("%s: compare(%v, %v) = %d, %v; want %d", name, a, b, got, err, exact(a, b))
+				}
+			}
+		}
+	}
+	// mixed kinds still use the exact comparison
+	if got, err := compare(int64(2), 2.5, false); err != nil || got != -1 {
+		t.Errorf("compare(int64 2, 2.5) = %d, %v", got, err)
+	}
+	// NaN and infinities are still refused, as before
+	if _, err := compare(math.NaN(), 1.0, false); err == nil {
+		t.Error("NaN should not order")
+	}
+	if _, err := compare(math.Inf(1), 1.0, false); err == nil {
+		t.Error("Inf should not order")
+	}
 }

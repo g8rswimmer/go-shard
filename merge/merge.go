@@ -243,6 +243,7 @@ type cursor struct {
 	idx   int
 	width int
 	row   []any // nil when exhausted
+	ptrs  []any // scan destinations, reused: they are rewritten for every row
 }
 
 func (c *cursor) advance() error {
@@ -251,11 +252,13 @@ func (c *cursor) advance() error {
 		return c.src.Err()
 	}
 	vals := make([]any, c.width)
-	ptrs := make([]any, c.width)
-	for i := range vals {
-		ptrs[i] = &vals[i]
+	if c.ptrs == nil {
+		c.ptrs = make([]any, c.width)
 	}
-	if err := c.src.Scan(ptrs...); err != nil {
+	for i := range vals {
+		c.ptrs[i] = &vals[i]
+	}
+	if err := c.src.Scan(c.ptrs...); err != nil {
 		return err
 	}
 	c.row = vals

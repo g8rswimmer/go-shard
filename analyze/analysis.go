@@ -27,15 +27,20 @@ var (
 type OpKind int
 
 const (
+	// OpSelect is a SELECT.
 	OpSelect OpKind = iota + 1
+	// OpInsert is an INSERT.
 	OpInsert
+	// OpUpdate is an UPDATE.
 	OpUpdate
+	// OpDelete is a DELETE.
 	OpDelete
 	// OpOther is any statement that cannot be routed from its predicates, such
 	// as DDL. Analysis.Kind names it.
 	OpOther
 )
 
+// String returns the SQL keyword: SELECT, INSERT, UPDATE, DELETE, or OTHER.
 func (o OpKind) String() string {
 	switch o {
 	case OpSelect:

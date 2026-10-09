@@ -47,8 +47,11 @@ type Config struct {
 	// MaxFanout bounds how many shards one statement runs on at once. Zero
 	// uses 8.
 	MaxFanout int
-	// ShardTimeout limits each shard's work, including streaming its rows.
-	// Zero means no limit beyond the caller's context.
+	// ShardTimeout limits each shard's work on a statement. For a query it is
+	// the time the shard has to start answering, and then the time to read its
+	// rows, counted from when every shard has answered (so waiting for a slow
+	// shard never uses up the time a fast one has). For a write it is the whole
+	// statement. Zero means no limit beyond the caller's context.
 	ShardTimeout time.Duration
 	// MaxMergeRows bounds the rows, or groups, a query that runs on several
 	// shards may hold in memory while merging: the groups of a GROUP BY or

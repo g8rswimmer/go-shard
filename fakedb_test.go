@@ -77,7 +77,12 @@ func (r *fakeRows) Next(dest []driver.Value) error {
 // explain registry (profiles sharded by id, addresses colocated).
 func fakeDB(t *testing.T, hooks observe.Hooks, shards ...*fakeShard) *DB {
 	t.Helper()
-	cfg := Config{Registry: explainRegistry(t), Hooks: hooks}
+	return fakeDBFor(t, Config{Registry: explainRegistry(t), Hooks: hooks}, shards...)
+}
+
+// fakeDBFor is fakeDB for a Config that already has a Registry.
+func fakeDBFor(t testing.TB, cfg Config, shards ...*fakeShard) *DB {
+	t.Helper()
 	conns := map[ShardID]exec.Conn{}
 	for i, f := range shards {
 		id := ShardID(fmt.Sprintf("shard-%02d", i+1))

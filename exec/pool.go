@@ -25,7 +25,10 @@ type ShardError struct {
 	Err   error
 }
 
+// Error names the shard and gives the underlying error.
 func (e *ShardError) Error() string { return fmt.Sprintf("shard %s: %v", e.Shard, e.Err) }
+
+// Unwrap returns the underlying error, for errors.Is and errors.As.
 func (e *ShardError) Unwrap() error { return e.Err }
 
 // Conn is the part of *sql.DB the executor uses. It exists so the executor can

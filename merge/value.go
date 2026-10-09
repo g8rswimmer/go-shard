@@ -2,6 +2,7 @@ package merge
 
 import (
 	"bytes"
+	"cmp"
 	"database/sql"
 	"fmt"
 	"math"
@@ -16,6 +17,16 @@ import (
 // numbers (PostgreSQL's numeric type arrives as text).
 func compare(a, b any, numeric bool) (int, error) {
 	switch x := a.(type) {
+	case int64:
+		// by far the most common sort key; avoids the exact (and allocating)
+		// comparison below
+		if y, ok := b.(int64); ok {
+			return cmp.Compare(x, y), nil
+		}
+	case float64:
+		if y, ok := b.(float64); ok && finite(x) && finite(y) {
+			return cmp.Compare(x, y), nil
+		}
 	case string:
 		if y, ok := b.(string); ok && !numeric {
 			return strings.Compare(x, y), nil
@@ -48,6 +59,8 @@ func compare(a, b any, numeric bool) (int, error) {
 	}
 	return 0, fmt.Errorf("shard: cannot order %T against %T while merging", a, b)
 }
+
+func finite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
 
 // toRat converts a number to an exact rational, or returns nil.
 func toRat(v any) *big.Rat {

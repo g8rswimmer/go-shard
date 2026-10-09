@@ -23,6 +23,7 @@ const (
 	ExecCall
 )
 
+// String returns "query" or "exec".
 func (k CallKind) String() string {
 	switch k {
 	case QueryCall:

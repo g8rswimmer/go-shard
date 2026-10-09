@@ -41,6 +41,7 @@ const (
 	KindGlobal
 )
 
+// String returns "sharded", "colocated" or "global".
 func (k Kind) String() string {
 	switch k {
 	case KindSharded:
@@ -67,11 +68,15 @@ type KeyType int
 const (
 	// KeyTypeUnset means no type was declared.
 	KeyTypeUnset KeyType = iota
+	// KeyInt is an integer key (bigint, int).
 	KeyInt
+	// KeyUUID is a UUID key.
 	KeyUUID
+	// KeyString is a text key.
 	KeyString
 )
 
+// String returns "unset", "int", "uuid" or "string".
 func (t KeyType) String() string {
 	switch t {
 	case KeyTypeUnset:

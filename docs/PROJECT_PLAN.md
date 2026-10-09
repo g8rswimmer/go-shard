@@ -109,11 +109,12 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** tests assert hook call order for single and fan-out queries, and an otel test checks span attributes (shards, strategy).
 
 ### M10 Hardening (M)
-- Failure-injection pass: stop a shard mid-query, kill connections, slow shards hitting timeouts, context cancellation mid-merge; check for goroutine leaks (`goleak`).
-- Benchmarks: routing overhead versus a direct `database/sql` call; merge throughput.
-- Documentation: README quick start, supported/unsupported query reference, error reference, upgrade notes; godoc on all exported symbols.
-- Confirm every example runs in CI; versioning policy and changelog.
-- Resolve the remaining open decisions in section 5 below.
+- Failure injection (`failure_integration_test.go`, each ending with a `goleak` check): a shard hitting `ShardTimeout` (a table lock), `AllowPartial` and writes with it, the caller cancelling while a shard is blocked, cancelling and abandoning a merge, connections killed under a running query and while idle, and (container mode) a shard stopped mid-query. `goleak.VerifyTestMain` guards every unit-test package.
+- Found and fixed: the shard timeout of a query expired the rows of shards that had answered while a slow shard was awaited (`exec/timeout.go`, ARCHITECTURE 5.4); and merging ordered integers went through exact decimal arithmetic (5-6x faster now, `merge/value.go`).
+- Benchmarks (`make bench`, `make bench-integration`): routing overhead against a direct `database/sql` call, against real PostgreSQL, and merge throughput; recorded in docs/BENCHMARKS.md. Raw SQL costs about 100 µs a call to parse (a possible cache is recorded, not built).
+- Documentation: README with quick start, docs/QUERIES.md (supported and unsupported), docs/ERRORS.md, docs/OPERATIONS.md, docs/BENCHMARKS.md, docs/VERSIONING.md, CHANGELOG.md, docs/UPGRADING.md; godoc on every exported symbol, enforced by the linter (`exclude-use-default: false` turns on revive's `exported`).
+- Every example runs in CI against real PostgreSQL (`TestExamplesRun` checks the exit code and key output lines); `make example-<name>` and `make examples`; benchmarks run for one iteration in CI so they keep working.
+- Open decisions settled (section 5).
 - **Done when:** failure-injection tests and benchmarks pass and the docs are complete.
 
 ### M11 Demo guide and v0.1.0 release (S) - FR-14
@@ -148,15 +149,18 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 | Scope creep toward joins and distributed transactions | v1 never ships | Both are non-goals; changes go through REQUIREMENTS section 8 |
 | Raw SQL support grows without bound | Maintenance burden | Supported subset is documented and enforced; unsupported constructs fail loudly |
 
-## 5. Open decisions to settle before M11
+## 5. Open decisions
+
+All settled by the end of M10.
 
 Decided: minimum Go 1.26 and PostgreSQL 14+.
 
 (Carried from architecture section 11.)
 
 - ~~Whether `observe/otel` is a separate Go module.~~ Decided in M9: a subpackage of the main module (see ARCHITECTURE 5.10).
-- Builder API shape: fluent builder in v1, typed repositories later. Confirm in M3 review.
-- Where the idempotency-key table is created. Decide in M4.
+- ~~Builder API shape.~~ Decided: the fluent builder (package `query`) is the v1 API; typed repositories are not part of v0.x (they can sit on `Querier`).
+- ~~Where the idempotency-key table is created.~~ Decided in M4: explicitly, with `DB.EnsureIdempotencyTable` or the user's migrations; never implicitly.
+- ~~Read retries.~~ Decided in M10: the library does not retry; see ARCHITECTURE 5.4 and docs/OPERATIONS.md.
 
 ## 6. Quality gates
 
@@ -171,12 +175,12 @@ Release checklist for v0.1.0:
 
 - [ ] All FR-1 to FR-14 have passing tests (traceability table in ARCHITECTURE section 10).
 - [ ] Property test passes for the supported merge subset.
-- [ ] Failure-injection tests pass; no goroutine leaks.
-- [ ] Every example runs in CI against real Postgres.
+- [x] Failure-injection tests pass; no goroutine leaks (M10).
+- [x] Every example runs in CI against real Postgres (M10, `TestExamplesRun`).
 - [ ] README quick start works on a clean machine.
 - [ ] `docs/DEMO.md` completed end to end by someone other than its author, and its CI job passes.
-- [ ] Supported/unsupported query reference and error reference published.
-- [ ] Benchmarks recorded.
+- [x] Supported/unsupported query reference and error reference published (M10: docs/QUERIES.md, docs/ERRORS.md).
+- [x] Benchmarks recorded (M10: docs/BENCHMARKS.md).
 - [ ] Changelog and tag.
 
 ## 7. Suggested first steps

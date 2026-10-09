@@ -57,7 +57,7 @@ func (t *Tx) Query(ctx context.Context, query string, args []any) (*Rows, error)
 		cancel()
 		return nil, &ShardError{Shard: t.shard, Err: err}
 	}
-	return &Rows{Rows: rows, cancel: cancel}, nil
+	return &Rows{Rows: rows, cancel: cancel, pause: func() {}, restart: func() {}}, nil
 }
 
 // Exec runs a statement and returns the rows it affected.
