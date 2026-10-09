@@ -109,6 +109,7 @@ registry.Global("countries")
 ### FR-11 Observability and health
 - Per-shard health and pool stats, structured logging, and tracing/metrics hooks (OpenTelemetry-friendly).
 - Includes the routing decision and per-shard latency.
+- Statement arguments are never given to hooks or logged; the SQL text only when asked.
 
 ### FR-12 Examples
 - Runnable examples show each major capability, so a new user can copy one and have it work:

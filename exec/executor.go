@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/plan"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -27,6 +28,8 @@ type Options struct {
 	// MaxFanout bounds concurrent shard calls per statement. Zero uses
 	// DefaultMaxFanout.
 	MaxFanout int
+	// Hooks hear about the work on each shard. Nil means none.
+	Hooks observe.Hooks
 }
 
 // Executor runs plans on the shards of a Pool.
@@ -34,11 +37,12 @@ type Executor struct {
 	pool      *Pool
 	timeout   time.Duration
 	maxFanout int
+	hooks     shardHooks
 }
 
 // NewExecutor returns an Executor for the pool.
 func NewExecutor(pool *Pool, opts Options) *Executor {
-	e := &Executor{pool: pool, timeout: opts.ShardTimeout, maxFanout: opts.MaxFanout}
+	e := &Executor{pool: pool, timeout: opts.ShardTimeout, maxFanout: opts.MaxFanout, hooks: shardHooks{opts.Hooks}}
 	if e.maxFanout <= 0 {
 		e.maxFanout = DefaultMaxFanout
 	}
@@ -135,7 +139,9 @@ func (e *Executor) query(ctx context.Context, p plan.Plan, partial bool) ([]Shar
 			// Query exits does not cut off rows the caller is still reading.
 			stop := context.AfterFunc(failCtx, cancel)
 			query, args := p.StatementFor(id)
-			rows, err := conns[i].QueryContext(sctx, query, args...)
+			hctx, began := e.hooks.start(sctx, observe.Query, id)
+			rows, err := conns[i].QueryContext(hctx, query, args...)
+			e.hooks.done(hctx, observe.Query, id, began, 0, false, err)
 			stop()
 			if err != nil {
 				cancel()
@@ -204,16 +210,18 @@ func (e *Executor) exec(ctx context.Context, p plan.Plan, idem *Idempotency) ([]
 			defer cancel()
 			query, args := p.StatementFor(id)
 			o := ShardExec{Shard: id, Rows: p.Rows[id]}
+			hctx, began := e.hooks.start(sctx, observe.Exec, id)
 			switch {
 			case idem != nil:
-				o.RowsAffected, o.Replayed, o.Err = runIdempotent(sctx, conns[i], id, query, args, *idem)
+				o.RowsAffected, o.Replayed, o.Err = runIdempotent(hctx, conns[i], id, query, args, *idem)
 			default:
-				res, err := conns[i].ExecContext(sctx, query, args...)
+				res, err := conns[i].ExecContext(hctx, query, args...)
 				o.Err = err
 				if err == nil {
 					o.RowsAffected, _ = res.RowsAffected()
 				}
 			}
+			e.hooks.done(hctx, observe.Exec, id, began, o.RowsAffected, o.Replayed, o.Err)
 			out[i] = o
 			return nil
 		})

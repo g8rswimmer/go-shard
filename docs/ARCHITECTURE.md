@@ -49,7 +49,7 @@ go-shard/
   exec/               Shard pool, parallel executor, tx pinning (FR-1, FR-8)
   merge/              Ordered merge, limit/offset, distinct, aggregates (FR-5)
   migrate/            Fan-out migration runner, status, drift (FR-10)
-  observe/            Hooks interface, slog adapter; otel/ subpackage (FR-11)
+  observe/            Hooks interface, Multi, Slog adapter; otel/ subpackage (FR-11)
   shardtest/          Public test support: containers, fake, assertions (FR-13)
   examples/           Runnable examples, one directory each (FR-12)
   docker-compose.yml  3 local Postgres shards for examples and the demo
@@ -62,7 +62,10 @@ Dependency direction (arrows mean "imports"). Nothing imports the facade, and on
 shard -> plan, exec, merge, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
 plan -> router, registry, analyze
 query -> analyze
-exec, merge -> (types from plan/registry only)
+exec -> observe
+merge -> (types from plan/registry only)
+observe -> router (ShardID)
+observe/otel -> observe, OpenTelemetry
 migrate -> router (ShardID), golang-migrate
 analyze -> registry
 analyze/pgparse -> cgo (pg_query_go)
@@ -403,10 +406,26 @@ st, err := runner.Status(ctx)     // per-shard version; st.Drift(), st.Behind(),
 
 ### 5.10 Observability (FR-11)
 
-- `observe.Hooks` is an interface with callbacks (`OnPlan`, `OnShardStart`, `OnShardDone`, `OnMerge`). Default is a no-op.
-- `observe.Slog` is a ready-made structured logging adapter.
-- `observe/otel` (separate Go module or subpackage) emits spans per query and per shard, and metrics for latency, fan-out width and errors.
-- `db.Health(ctx)` pings every shard and returns per-shard status and `sql.DBStats`.
+`Config.Hooks` (an `observe.Hooks`, default none) hears about every statement a `DB` runs, including those inside a `Tx` and `tx.Unchecked()`. Explain, Health, migrations and idempotency-table maintenance are not statements and are not reported.
+
+```go
+type Hooks interface {
+    OnPlan(ctx, PlanEvent) context.Context          // routing: kind, SQL, strategy, targets, reason, err, duration
+    OnShardStart(ctx, ShardStartEvent) context.Context
+    OnShardDone(ctx, ShardDoneEvent)                // shard, duration, rows affected, replayed, err
+    OnMerge(ctx, MergeEvent)                        // a query on several shards: merged, left out, duration
+    OnDone(ctx, DoneEvent)                          // strategy, targets, duration, err
+}
+```
+
+- **Order.** `OnPlan` always comes first and `OnDone` always last. A statement that cannot be routed has only those two (`PlanEvent.Err` set). Otherwise each shard contacted has `OnShardStart` then `OnShardDone` (in parallel with the other shards), and a query on several shards has `OnMerge` after the shards. This order is pinned by tests (`observe_test.go`).
+- **Context threading.** `OnPlan` and `OnShardStart` return the context for the rest of the statement and for that shard's work, which is how a tracer nests spans: the statement span is a child of the caller's span, and a shard span a child of the statement's. The executor passes the returned context to the database call.
+- **No arguments.** Events carry the SQL text but never the arguments, which commonly hold personal data. `Slog` and the OpenTelemetry hooks leave the SQL out unless asked (`WithSQL`, `WithStatement`).
+- **Times.** A query's per-shard time is until the shard starts answering (PostgreSQL has run the statement and the first rows are ready), not until the caller has read the rows; reading is the caller's pace, not the database's. A write's time is the whole statement. `DoneEvent.Duration` includes routing.
+- **Cost.** With no hooks, `Nop` is called; hooks are on the path of every statement, run concurrently from the shard goroutines, and must be fast and safe for concurrent use. `observe.Multi` chains several, passing each one's context to the next.
+- **`observe.Slog(logger, opts...)`** logs one line per statement (Debug when it succeeds, Error when it fails; `WithLevel`), a Warn line for a shard that fails or a merge that left shards out (these matter under `AllowPartial`), and per-shard lines with `WithShardEvents`.
+- **`observe/otel`** is a subpackage of the main module (not a separate module), so the OpenTelemetry API is a dependency of the module but is compiled only into programs that import it. `otel.New(opts...)` emits a `shard.query` / `shard.exec` span per statement (attributes `shard.strategy`, `shard.targets`, `shard.fanout`, `shard.reason`, `shard.kind`, `db.system`), a `shard.shard` child span per shard (`shard.id`, `shard.rows_affected`, `shard.replayed`), a `merge` event, and the metrics `go_shard.statement.duration`, `go_shard.shard.duration`, `go_shard.fanout.width` and `go_shard.shard.errors`. `otel.RegisterPoolMetrics(mp, db)` adds per-shard pool gauges.
+- **Health.** `db.Health(ctx)` pings every shard in parallel and returns `ShardHealth{ID, Err, Latency, Pool sql.DBStats}`. `db.PoolStats()` returns the pool statistics alone, without a ping.
 
 ### 5.11 Client interface and test support (FR-13)
 
@@ -489,6 +508,7 @@ Each example is a small `main` package under `examples/` with its own README:
 | `examples/fanout` | `WithAllShards()` with `ORDER BY`, `LIMIT`, `COUNT`/`AVG`, `GROUP BY` | FR-5 |
 | `examples/writes` | Batch insert split across shards, partial failure handling, idempotency key | FR-7 |
 | `examples/migrations` | Apply to all shards, status, drift detection, failure policy | FR-10 |
+| `examples/observability` | Slog and OpenTelemetry hooks, health and pool statistics | FR-11 |
 | `examples/explain` | Reading `Explain()` output for single, multi and all-shard queries | FR-9 |
 | `examples/testing` | Unit test with the fake and integration test with `NewCluster` | FR-13 |
 
@@ -592,9 +612,9 @@ Resolved from REQUIREMENTS section 7:
 - Merge design: the SQL is rewritten once into shard SQL plus a data `Spec`, and a separate `Merge` function combines rows by the Spec (no SQL knowledge), rather than a merger that interprets steps; `Plan` carries no merge steps.
 - Explain: a method on `Querier` that shares `scoped.plan` with Query/Exec (so it returns their errors); merge steps are rendered from the `merge.Spec` itself; per-shard `EXPLAIN` / `EXPLAIN ANALYZE` are options of a configured `Querier.Explainer(opts...)` (`ShardPlans`, `Analyze`) because `Explain` takes `args ...any` and ANALYZE should be visible where it is asked for; ANALYZE always runs in a rolled-back transaction. The fake is a recording `Querier` over `shard.Planner`, not a mock that executes SQL.
 - Without cgo the library still builds; only automatic routing of raw SQL is unavailable (docs/BUILDING.md).
+- Observability: five hooks (plan, shard start/done, merge, done) with context threading for spans; no arguments in events; `observe/otel` is a subpackage of the main module rather than a second module (one version to track; the cost is OpenTelemetry in `go.mod`); a query's per-shard time is time to first rows.
 - Migrations: wrap `golang-migrate` behind `Migrator`; forward-only; a failed shard is reset to its last good version (migrations are single transactions); a runner opens connections per operation rather than holding them.
 
 Still open (decide in the project plan or early implementation):
 
-- Whether `observe/otel` is a separate Go module to keep the core dependency-free.
 - Typed repositories on top of the builder (the fluent builder itself is done in M3).

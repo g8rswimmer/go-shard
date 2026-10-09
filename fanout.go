@@ -3,6 +3,7 @@ package shard
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/merge"
@@ -64,7 +65,7 @@ func (s shardSource) Err() error {
 }
 
 // fanOut runs a SELECT on several shards and merges the rows.
-func (s *scoped) fanOut(ctx context.Context, r request, p plan.Plan) (Rows, error) {
+func (s *scoped) fanOut(ctx context.Context, st *statement, r request, p plan.Plan) (Rows, error) {
 	if r.merge == nil {
 		return nil, fmt.Errorf("%w: running a query on %d shards needs its results merged, and merging needs the SQL rewritten, "+
 			"which needs an analyzer that supports it (the library was built without cgo); build the statement with package query, "+
@@ -95,7 +96,9 @@ func (s *scoped) fanOut(ctx context.Context, r request, p plan.Plan) (Rows, erro
 	for i, res := range results {
 		srcs[i] = shardSource{Rows: res.Rows, id: res.Shard}
 	}
+	began := time.Now()
 	rows, err := merge.Merge(mp.Spec, srcs, merge.Options{MaxRows: s.db.maxMerge})
+	st.merged(len(srcs), len(failed), began, err)
 	if err != nil {
 		return nil, err
 	}

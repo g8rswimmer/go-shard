@@ -102,9 +102,10 @@ M8 (migrations) depends only on M2 and can run in parallel with M3 to M7 if ther
 - **Done when:** an integration test fails a migration on one shard, shows drift in `Status`, fixes it, re-runs, and ends with all shards at the same version.
 
 ### M9 Observability (S) - FR-11
-- `observe.Hooks` wired into plan, per-shard execution and merge; `observe.Slog`.
-- `observe/otel`: spans and metrics (query latency, fan-out width, errors per shard).
-- `Health` returns per-shard status and pool stats.
+- `observe.Hooks` (`OnPlan`, `OnShardStart`, `OnShardDone`, `OnMerge`, `OnDone`; the first two return a context for nesting spans) wired into planning, per-shard execution (also in `Tx`) and merge via `Config.Hooks`; `observe.Nop`, `observe.Multi`, `observe.Slog`.
+- `observe/otel`: spans (statement and per shard) and metrics (statement and shard latency, fan-out width, errors per shard), `RegisterPoolMetrics`.
+- `Health` (per-shard status, latency, pool stats; from M2) and `DB.PoolStats` (no ping).
+- `examples/observability`.
 - **Done when:** tests assert hook call order for single and fan-out queries, and an otel test checks span attributes (shards, strategy).
 
 ### M10 Hardening (M)
@@ -153,7 +154,7 @@ Decided: minimum Go 1.26 and PostgreSQL 14+.
 
 (Carried from architecture section 11.)
 
-- Whether `observe/otel` is a separate Go module. Decide by M9.
+- ~~Whether `observe/otel` is a separate Go module.~~ Decided in M9: a subpackage of the main module (see ARCHITECTURE 5.10).
 - Builder API shape: fluent builder in v1, typed repositories later. Confirm in M3 review.
 - Where the idempotency-key table is created. Decide in M4.
 

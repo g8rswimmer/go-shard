@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/merge"
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/plan"
 )
 
@@ -242,13 +244,16 @@ func statementRequest(st Statement) request {
 	return r
 }
 
-func (s *scoped) query(ctx context.Context, r request) (Rows, error) {
+func (s *scoped) query(ctx context.Context, r request) (rows Rows, err error) {
+	start := time.Now()
 	p, err := s.plan(r)
+	ctx, st := s.db.begin(ctx, observe.Query, r.sql, start, p, err)
+	defer func() { st.done(err) }()
 	if err != nil {
 		return nil, err
 	}
 	if len(p.Targets) > 1 {
-		return s.fanOut(ctx, r, p)
+		return s.fanOut(ctx, st, r, p)
 	}
 	res, err := s.db.exec.Query(ctx, p)
 	if err != nil {
@@ -257,8 +262,11 @@ func (s *scoped) query(ctx context.Context, r request) (Rows, error) {
 	return res[0].Rows, nil
 }
 
-func (s *scoped) exec(ctx context.Context, r request) (WriteResult, error) {
+func (s *scoped) exec(ctx context.Context, r request) (res WriteResult, err error) {
+	start := time.Now()
 	p, err := s.plan(r)
+	ctx, st := s.db.begin(ctx, observe.Exec, r.sql, start, p, err)
+	defer func() { st.done(err) }()
 	if err != nil {
 		return WriteResult{}, err
 	}
@@ -277,7 +285,7 @@ func (s *scoped) exec(ctx context.Context, r request) (WriteResult, error) {
 		return WriteResult{}, err
 	}
 
-	res := WriteResult{PerShard: make(map[ShardID]ShardOutcome, len(outcomes))}
+	res = WriteResult{PerShard: make(map[ShardID]ShardOutcome, len(outcomes))}
 	var failed []error
 	for _, o := range outcomes {
 		out := ShardOutcome{RowsAffected: o.RowsAffected, Rows: o.Rows, Replayed: o.Replayed}

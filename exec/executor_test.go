@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/plan"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -110,8 +112,18 @@ func TestQueryDefaultFanout(t *testing.T) {
 }
 
 func TestQueryFailsFastAndCancelsOthers(t *testing.T) {
-	slow := &fakeShard{query: blockUntilDone}
-	bad := &fakeShard{query: func(context.Context) (int, error) { return 0, errors.New("boom") }}
+	// The failure waits until the slow shard is running its query: if the other
+	// shard failed first, the slow query could be cancelled before it began and
+	// the driver would never see it.
+	slowRunning := make(chan struct{})
+	slow := &fakeShard{query: func(ctx context.Context) (int, error) {
+		close(slowRunning)
+		return blockUntilDone(ctx)
+	}}
+	bad := &fakeShard{query: func(context.Context) (int, error) {
+		<-slowRunning
+		return 0, errors.New("boom")
+	}}
 	ok := &fakeShard{query: func(context.Context) (int, error) { return 1, nil }}
 	pool := newPool(t, slow, bad, ok)
 
@@ -376,5 +388,122 @@ func TestQueryPartialCallerCancellation(t *testing.T) {
 	_, _, err := NewExecutor(pool, Options{}).QueryPartial(ctx, planFor("s0", "s1"))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// hookLog records the shard events it hears.
+type hookLog struct {
+	observe.Nop
+	mu     sync.Mutex
+	starts []observe.ShardStartEvent
+	dones  []observe.ShardDoneEvent
+}
+
+type hookCtxKey struct{}
+
+func (h *hookLog) OnShardStart(ctx context.Context, e observe.ShardStartEvent) context.Context {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.starts = append(h.starts, e)
+	return context.WithValue(ctx, hookCtxKey{}, e.Shard)
+}
+
+func (h *hookLog) OnShardDone(ctx context.Context, e observe.ShardDoneEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ctx.Value(hookCtxKey{}) != e.Shard {
+		panic("OnShardDone did not get the context OnShardStart returned")
+	}
+	h.dones = append(h.dones, e)
+}
+
+func TestShardHooksForQueryAndExec(t *testing.T) {
+	boom := errors.New("boom")
+	pool := newPool(t,
+		&fakeShard{exec: func(context.Context) (int64, error) { return 4, nil }},
+		&fakeShard{exec: func(context.Context) (int64, error) { return 0, boom }},
+	)
+	h := &hookLog{}
+	ex := NewExecutor(pool, Options{Hooks: h})
+
+	got, err := ex.Query(context.Background(), planFor("s0", "s1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		_ = r.Rows.Close()
+	}
+	if len(h.starts) != 2 || len(h.dones) != 2 || h.dones[0].Kind != observe.Query || h.dones[0].Err != nil {
+		t.Fatalf("query events: %+v %+v", h.starts, h.dones)
+	}
+
+	h.starts, h.dones = nil, nil
+	if _, err := ex.Exec(context.Background(), planFor("s0", "s1")); err != nil {
+		t.Fatal(err)
+	}
+	byShard := map[router.ShardID]observe.ShardDoneEvent{}
+	for _, d := range h.dones {
+		byShard[d.Shard] = d
+	}
+	switch {
+	case len(h.starts) != 2:
+		t.Errorf("starts = %+v", h.starts)
+	case byShard["s0"].Kind != observe.Exec || byShard["s0"].RowsAffected != 4 || byShard["s0"].Err != nil:
+		t.Errorf("s0 = %+v", byShard["s0"])
+	case !errors.Is(byShard["s1"].Err, boom) || byShard["s1"].RowsAffected != 0:
+		t.Errorf("s1 = %+v", byShard["s1"])
+	default:
+		// as expected
+	}
+}
+
+func TestShardHooksForATransaction(t *testing.T) {
+	pool := newPool(t, &fakeShard{exec: func(context.Context) (int64, error) { return 2, nil }})
+	h := &hookLog{}
+	tx, err := NewExecutor(pool, Options{Hooks: h}).Begin(context.Background(), "s0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(context.Background(), "SELECT 1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if n, err := tx.Exec(context.Background(), "UPDATE t SET a = 1", nil); err != nil || n != 2 {
+		t.Fatalf("Exec = %d, %v", n, err)
+	}
+	if len(h.dones) != 2 || h.dones[0].Kind != observe.Query || h.dones[1].Kind != observe.Exec || h.dones[1].RowsAffected != 2 {
+		t.Errorf("events = %+v", h.dones)
+	}
+}
+
+// The context a hook returns is the one the database call gets, so anything
+// instrumenting the driver (or a trace) sees the shard's span.
+func TestShardWorkRunsWithTheHookContext(t *testing.T) {
+	var queryGot, execGot atomic.Value
+	seen := func(into *atomic.Value) func(context.Context) {
+		return func(ctx context.Context) { into.Store(ctx.Value(hookCtxKey{}) == router.ShardID("s0")) }
+	}
+	q, e := seen(&queryGot), seen(&execGot)
+	pool := newPool(t, &fakeShard{
+		query: func(ctx context.Context) (int, error) { q(ctx); return 1, nil },
+		exec:  func(ctx context.Context) (int64, error) { e(ctx); return 1, nil },
+	})
+	ex := NewExecutor(pool, Options{Hooks: &hookLog{}})
+
+	rows, err := ex.Query(context.Background(), planFor("s0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rows[0].Rows.Close()
+	if _, err := ex.Exec(context.Background(), planFor("s0")); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, v := range map[string]*atomic.Value{"Query": &queryGot, "Exec": &execGot} {
+		if got, _ := v.Load().(bool); !got {
+			t.Errorf("%s: the database call did not get the context OnShardStart returned", name)
+		}
 	}
 }
