@@ -117,6 +117,15 @@ func (p *Pool) Close() error {
 	return errors.Join(errs...)
 }
 
+// Stats returns each shard's pool statistics. It does not contact the shards.
+func (p *Pool) Stats() map[router.ShardID]sql.DBStats {
+	out := make(map[router.ShardID]sql.DBStats, len(p.ids))
+	for _, id := range p.ids {
+		out[id] = p.conns[id].Stats()
+	}
+	return out
+}
+
 // ShardHealth is the result of pinging one shard.
 type ShardHealth struct {
 	ID      router.ShardID

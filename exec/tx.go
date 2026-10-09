@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/router"
 )
 
@@ -19,6 +20,7 @@ type Tx struct {
 	shard   router.ShardID
 	tx      *sql.Tx
 	timeout time.Duration
+	hooks   shardHooks
 }
 
 // Begin starts a transaction on one shard.
@@ -31,7 +33,7 @@ func (e *Executor) Begin(ctx context.Context, id router.ShardID, opts *sql.TxOpt
 	if err != nil {
 		return nil, &ShardError{Shard: id, Err: err}
 	}
-	return &Tx{shard: id, tx: tx, timeout: e.timeout}, nil
+	return &Tx{shard: id, tx: tx, timeout: e.timeout, hooks: e.hooks}, nil
 }
 
 // Shard returns the shard the transaction runs on.
@@ -48,7 +50,9 @@ func (t *Tx) statementContext(parent context.Context) (context.Context, context.
 // next statement: a transaction has one connection, which is busy until then.
 func (t *Tx) Query(ctx context.Context, query string, args []any) (*Rows, error) {
 	sctx, cancel := t.statementContext(ctx)
-	rows, err := t.tx.QueryContext(sctx, query, args...)
+	hctx, began := t.hooks.start(sctx, observe.Query, t.shard)
+	rows, err := t.tx.QueryContext(hctx, query, args...)
+	t.hooks.done(hctx, observe.Query, t.shard, began, 0, false, err)
 	if err != nil {
 		cancel()
 		return nil, &ShardError{Shard: t.shard, Err: err}
@@ -60,11 +64,16 @@ func (t *Tx) Query(ctx context.Context, query string, args []any) (*Rows, error)
 func (t *Tx) Exec(ctx context.Context, query string, args []any) (int64, error) {
 	sctx, cancel := t.statementContext(ctx)
 	defer cancel()
-	res, err := t.tx.ExecContext(sctx, query, args...)
+	hctx, began := t.hooks.start(sctx, observe.Exec, t.shard)
+	res, err := t.tx.ExecContext(hctx, query, args...)
+	var n int64
+	if err == nil {
+		n, _ = res.RowsAffected()
+	}
+	t.hooks.done(hctx, observe.Exec, t.shard, began, n, false, err)
 	if err != nil {
 		return 0, &ShardError{Shard: t.shard, Err: err}
 	}
-	n, _ := res.RowsAffected()
 	return n, nil
 }
 

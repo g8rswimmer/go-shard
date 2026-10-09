@@ -38,6 +38,11 @@
 //	e, err := db.Explain(ctx, "SELECT name FROM profiles WHERE id = $1", id)
 //	fmt.Println(e) // strategy, targets, reason, shard SQL, merge steps
 //
+// Config.Hooks (package observe) reports every statement's routing, each
+// shard's work, the merge and the outcome, for logs (observe.Slog), traces and
+// metrics (observe/otel). Health and PoolStats report the shards and their
+// connection pools.
+//
 // Migrations returns a migrate.Runner for the configured shards, which applies
 // the same versioned migrations to every shard and reports drift.
 //
@@ -47,11 +52,13 @@ package shard
 
 import (
 	"context"
+	"database/sql"
 	"sync/atomic"
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
 	"github.com/g8rswimmer/go-shard/migrate"
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -67,6 +74,7 @@ type DB struct {
 	maxMerge  int              // rows or groups a merge may hold
 	next      atomic.Uint64    // spreads statements any shard can answer
 	shards    []migrate.Shard  // for Migrations
+	hooks     observe.Hooks    // never nil
 }
 
 var _ Querier = (*DB)(nil)
@@ -92,7 +100,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
-	ex := exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout})
+	ex := exec.NewExecutor(pool, exec.Options{ShardTimeout: cfg.ShardTimeout, MaxFanout: cfg.MaxFanout, Hooks: cfg.Hooks})
 	return newDB(cfg, r, pool, ex), nil
 }
 
@@ -111,12 +119,17 @@ func newDB(cfg Config, r *router.HashRouter, pool *exec.Pool, ex *exec.Executor)
 	if maxMerge == 0 {
 		maxMerge = defaultMaxMergeRows
 	}
+	hooks := cfg.Hooks
+	if hooks == nil {
+		hooks = observe.Nop{}
+	}
 	shards := make([]migrate.Shard, len(cfg.Shards))
 	for i, sc := range cfg.Shards {
 		shards[i] = migrate.Shard{ID: sc.ID, DSN: sc.DSN}
 	}
 	return &DB{
 		shards:    shards,
+		hooks:     hooks,
 		idemTable: idemTable,
 		maxMerge:  maxMerge,
 		registry:  cfg.Registry,
@@ -149,3 +162,7 @@ type ShardHealth = exec.ShardHealth
 // Health pings every shard in parallel and returns one entry per shard, sorted
 // by ID, with latency and connection pool statistics.
 func (db *DB) Health(ctx context.Context) []ShardHealth { return db.pool.Health(ctx) }
+
+// PoolStats returns each shard's connection pool statistics without contacting
+// the shards (Health pings them). It is cheap enough to call on every scrape.
+func (db *DB) PoolStats() map[ShardID]sql.DBStats { return db.pool.Stats() }

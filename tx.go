@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/g8rswimmer/go-shard/exec"
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/plan"
 	"github.com/g8rswimmer/go-shard/registry"
 )
@@ -274,19 +276,27 @@ func (t *tx) withShardPlans(ctx context.Context, cfg explainConfig, e Explain, p
 	}
 }
 
-func (t *tx) query(ctx context.Context, r request) (Rows, error) {
+func (t *tx) query(ctx context.Context, r request) (rows Rows, err error) {
+	start := time.Now()
 	p, err := t.plan(r)
+	ctx, st := t.db.begin(ctx, observe.Query, r.sql, start, p, err)
+	defer func() { st.done(err) }()
 	if err != nil {
 		return nil, err
 	}
 	return t.t.Query(ctx, p.SQL, p.Args)
 }
 
-func (t *tx) exec(ctx context.Context, r request) (WriteResult, error) {
+func (t *tx) exec(ctx context.Context, r request) (res WriteResult, err error) {
+	start := time.Now()
 	if err := rejectKey(ctx); err != nil {
+		_, st := t.db.begin(ctx, observe.Exec, r.sql, start, plan.Plan{}, err)
+		st.done(err)
 		return WriteResult{}, err
 	}
 	p, err := t.plan(r)
+	ctx, st := t.db.begin(ctx, observe.Exec, r.sql, start, p, err)
+	defer func() { st.done(err) }()
 	if err != nil {
 		return WriteResult{}, err
 	}
@@ -349,18 +359,34 @@ type uncheckedTx struct{ t *tx }
 
 var _ Querier = uncheckedTx{}
 
-func (u uncheckedTx) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
+// unrouted is the plan of a statement run with tx.Unchecked().
+func (u uncheckedTx) unrouted(sql string, args []any) plan.Plan {
+	return plan.Plan{
+		SQL: sql, Args: args, Targets: []ShardID{u.t.id}, Strategy: plan.Single,
+		Reason: fmt.Sprintf("tx.Unchecked(): the transaction's shard %s, not routed", u.t.id),
+	}
+}
+
+func (u uncheckedTx) Query(ctx context.Context, sql string, args ...any) (rows Rows, err error) {
+	start := time.Now()
+	ctx, st := u.t.db.begin(ctx, observe.Query, sql, start, u.unrouted(sql, args), nil)
+	defer func() { st.done(err) }()
 	return u.t.t.Query(ctx, sql, args)
 }
 
 func (u uncheckedTx) QueryStatement(ctx context.Context, st Statement) (Rows, error) {
-	return u.t.t.Query(ctx, st.SQL(), st.Args())
+	return u.Query(ctx, st.SQL(), st.Args()...)
 }
 
-func (u uncheckedTx) Exec(ctx context.Context, sql string, args ...any) (WriteResult, error) {
+func (u uncheckedTx) Exec(ctx context.Context, sql string, args ...any) (res WriteResult, err error) {
+	start := time.Now()
 	if err := rejectKey(ctx); err != nil {
+		_, st := u.t.db.begin(ctx, observe.Exec, sql, start, plan.Plan{}, err)
+		st.done(err)
 		return WriteResult{}, err
 	}
+	ctx, st := u.t.db.begin(ctx, observe.Exec, sql, start, u.unrouted(sql, args), nil)
+	defer func() { st.done(err) }()
 	return u.t.run(ctx, plan.Plan{SQL: sql, Args: args})
 }
 

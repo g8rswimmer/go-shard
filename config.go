@@ -7,6 +7,7 @@ import (
 
 	"github.com/g8rswimmer/go-shard/analyze"
 	"github.com/g8rswimmer/go-shard/exec"
+	"github.com/g8rswimmer/go-shard/observe"
 	"github.com/g8rswimmer/go-shard/registry"
 	"github.com/g8rswimmer/go-shard/router"
 )
@@ -64,6 +65,10 @@ type Config struct {
 	// none, and only WithShardKey / WithShard / WithAllShards and built
 	// statements (package query) can route. See docs/BUILDING.md.
 	Analyzer analyze.Analyzer
+	// Hooks are told about every statement: its routing, each shard's work, the
+	// merge and the outcome. Use observe.Slog for logs, observe/otel for
+	// OpenTelemetry, observe.Multi to use several. Nil means none.
+	Hooks observe.Hooks
 }
 
 // validate checks the config and builds the router. The error wraps
