@@ -49,6 +49,13 @@ var examples = []struct {
 		"drift: yes",
 		"shard-03: 3 countries",
 	}},
+	{"adopt", []string{
+		"profiles: 100 rows copied",
+		"profiles after a second run: 100",
+		"addresses: 200 in the old database, 200 on the shards",
+		"profiles on a shard other than the one the router chooses: 0",
+		"addresses without their profile on the same shard: 0",
+	}},
 	{"observability", []string{
 		"strategy=all targets=shard-01,shard-02,shard-03",
 		"event merge",

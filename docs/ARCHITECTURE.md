@@ -525,10 +525,11 @@ Conventions:
 `docs/DEMO.md` is a manual test script built on the same pieces as the examples:
 
 - **Environment:** `docker-compose.yml` (3 shards) plus `make demo-setup` / `make demo-reset`. Setup applies the demo migrations and loads a fixed dataset (profiles, addresses, countries) generated from a seed, so results are the same on every run.
-- **Driver:** a small `examples/demo` CLI with one subcommand per scenario (for example `demo route`, `demo fanout`, `demo partial-failure`). The guide runs these rather than asking the reader to write code.
+- **Driver:** a small `examples/demo` CLI with one subcommand per scenario (`where`, `colocated`, `fanout`, `nokey`, `tx`, `batch`, `migrate-break`/`migrate`/`migrate-fix`, `health`, `logs`; `setup` and `reset` for the dataset). The guide runs these rather than asking the reader to write code.
 - **Scenario format:** each scenario has *Command*, *Expected output*, *What it proves*, and a pass/fail checkbox.
 - **Failure scenarios** use `docker compose stop shard-02` / `start` to take a shard down, so the reader sees the partial-failure and fail-fast behavior for real.
-- **Staying accurate:** a CI job extracts the fenced commands and expected-output blocks from `DEMO.md`, runs them against the compose cluster, and fails on any difference.
+- **Staying accurate:** `make demo-check` (the CI job `demo`) resets the shards, then `TestDemoGuide` (`examples/demo/guide_integration_test.go`) runs every `sh` block of `DEMO.md` from the repository root and compares the output with the `text` block that follows it. A block marked `sh skip` is shown but not run. Every command prints the same output on every run (no times, no durations; fan-out per-shard events are left out of the log scenario because shards finish in any order).
+- **The shard-down scenario** (`batch`) runs `docker compose stop` and `start` itself, because `shard.Open` refuses to start with an unreachable shard: the library has to be connected before the shard goes away.
 
 ## 6. Configuration (FR-1)
 
@@ -586,22 +587,24 @@ Sentinel errors, wrapped with context, usable with `errors.Is`:
 
 ## 10. Requirements traceability
 
-| Requirement | Where |
-|---|---|
-| FR-1 Topology | 5.4, 6 |
-| FR-2 Registry | 5.1 |
-| FR-3 Routing | 4.3, 5.2 |
-| FR-4 Query API | 5.3 |
-| FR-5 Fan-out and merge | 4.2, 5.4, 5.5 |
-| FR-6 Colocation | 4.3, 5.1 |
-| FR-7 Writes | 5.6 |
-| FR-8 Transactions | 5.7 |
-| FR-9 Explain | 5.8 |
-| FR-10 Migrations | 5.9 |
-| FR-11 Observability | 5.10 |
-| FR-12 Examples | 5.12 |
-| FR-13 Test support | 5.11 |
-| FR-14 Demo guide | 5.13 |
+| Requirement | Where | Tests |
+|---|---|---|
+| FR-1 Topology | 5.4, 6 | `config_test.go`, `integration_test.go`, `exec/executor_test.go` |
+| FR-2 Registry | 5.1 | `registry/registry_test.go` |
+| FR-3 Routing | 4.3, 5.2 | `router/router_test.go` (fixed vectors), `router/key_test.go` |
+| FR-4 Query API | 5.3 | `plan/route_suite_test.go`, `autoroute_test.go`, `query/query_test.go`, `plan/builder_equiv_test.go` |
+| FR-5 Fan-out and merge | 4.2, 5.4, 5.5 | `merge/merge_test.go`, `fanout_test.go`, `fanout_integration_test.go`, `fanout_property_integration_test.go` |
+| FR-6 Colocation | 4.3, 5.1 | `plan/route_suite_test.go`, `registry/registry_test.go`, `tx_integration_test.go` |
+| FR-7 Writes | 5.6 | `writes_test.go`, `writes_integration_test.go`, `exec/idempotency_test.go` |
+| FR-8 Transactions | 5.7 | `tx_test.go`, `tx_integration_test.go`, `exec/tx_test.go` |
+| FR-9 Explain | 5.8 | `explain_test.go`, `explain_integration_test.go` |
+| FR-10 Migrations | 5.9 | `migrate/migrate_test.go`, `migrate/integration_test.go`, `migrations_test.go` |
+| FR-11 Observability | 5.10 | `observe_test.go`, `observe_otel_test.go`, `observe_integration_test.go`, `observe/` |
+| FR-12 Examples | 5.12 | `examples/run_integration_test.go` |
+| FR-13 Test support | 5.11 | `shardtest/` |
+| FR-14 Demo guide | 5.13 | `examples/demo/guide_integration_test.go` |
+
+Failure behavior (FR-1, FR-5, FR-7) is also covered by `failure_integration_test.go`.
 
 ## 11. Resolved and remaining decisions
 

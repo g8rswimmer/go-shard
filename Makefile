@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose bench bench-integration examples up down
+.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose bench bench-integration examples up down demo-setup demo-reset demo-check
 
 COMPOSE_DSNS := postgres://shard:shard@localhost:5441/shard?sslmode=disable,postgres://shard:shard@localhost:5442/shard?sslmode=disable,postgres://shard:shard@localhost:5443/shard?sslmode=disable
 
@@ -38,7 +38,7 @@ bench: ## Run the benchmarks that need no database (BENCHTIME=1x for a quick che
 bench-integration: ## Run the benchmarks against `make up` shards
 	SHARDTEST_DSNS='$(COMPOSE_DSNS)' go test -run '^$$' -bench . -benchmem -benchtime $(BENCHTIME) -p 1 -tags integration ./...
 
-EXAMPLES := quickstart colocation fanout writes explain migrations observability
+EXAMPLES := quickstart colocation fanout writes explain migrations observability adopt
 
 examples: $(addprefix example-,$(EXAMPLES)) ## Run every example against the `make up` shards
 
@@ -50,3 +50,14 @@ up: ## Start the 3 local Postgres shards and wait until healthy
 
 down: ## Stop the local shards and remove their data
 	docker compose down -v
+
+demo-setup: up ## Start the shards, migrate them and load the demo dataset (docs/DEMO.md)
+	go run ./examples/demo setup
+
+demo-reset: up ## Return the shards to the demo's starting state
+	go run ./examples/demo reset
+
+# Runs the commands in docs/DEMO.md and compares their output with the guide.
+# WARNING: resets the demo tables on the `make up` shards.
+demo-check: demo-reset ## Run docs/DEMO.md and check its expected output
+	DEMO_GUIDE=1 go test -count=1 -tags integration -run TestDemoGuide -v ./examples/demo

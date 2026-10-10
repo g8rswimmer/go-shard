@@ -53,3 +53,4 @@ POSTGRES_VERSION=18 make up
 - Touching routing, merging or the executor: run `make bench` before and after,
   and record a meaningful change in `docs/BENCHMARKS.md`.
 - Update the docs if a requirement or design decision changes.
+- Changing what a command prints in `examples/demo` or `docs/DEMO.md`: run `make demo-check`, which runs the guide and compares its output (it resets the demo tables on the `make up` shards).

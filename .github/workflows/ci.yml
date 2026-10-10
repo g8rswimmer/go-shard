@@ -72,3 +72,17 @@ jobs:
       - name: Stop shards
         if: always()
         run: make down
+
+  demo:
+    # docs/DEMO.md must stay true: this runs every command in it and compares
+    # the output. It stops and starts a shard, so it has its own cluster.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make demo-check
+      - name: Stop shards
+        if: always()
+        run: make down
