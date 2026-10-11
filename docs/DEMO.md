@@ -16,9 +16,10 @@ works.
 - Go 1.26+, a C compiler (the SQL parser uses cgo, see [BUILDING.md](BUILDING.md)),
   Docker with the `docker compose` plugin.
 - Run every command from the root of the repository.
-- The demo owns the tables `profiles`, `addresses`, `countries` and
-  `demo_migrations` on the three `make up` databases (ports 5441 to 5443).
-  `make demo-reset` drops them. Do not point it at databases you care about.
+- The demo owns the tables `demo_profiles`, `demo_addresses`, `demo_countries`
+  and `demo_migrations` on the three `make up` databases (ports 5441 to 5443).
+  `make demo-reset` drops them, and nothing else. Even so, do not point the
+  demo at databases you care about.
 - Each scenario that changes data puts it back, except the migration scenario,
   which leaves the shards at version 3. Run `make demo-reset` to go back to the start.
 
@@ -62,12 +63,12 @@ go run ./examples/demo where 7
 ```
 
 ```text
-== Explain: SELECT name, tier, score FROM profiles WHERE id = $1  [id = 7]
+== Explain: SELECT name, tier, score FROM demo_profiles WHERE id = $1  [id = 7]
   op:        SELECT
   strategy:  single
   targets:   shard-03
-  reason:    routed by key: profiles.id has 1 key value(s) -> [shard-03]
-  shard sql: SELECT name, tier, score FROM profiles WHERE id = $1
+  reason:    routed by key: demo_profiles.id has 1 key value(s) -> [shard-03]
+  shard sql: SELECT name, tier, score FROM demo_profiles WHERE id = $1
 == the row
   name	tier	score
   profile-07	silver	59
@@ -83,7 +84,7 @@ row on each shard through a connection that bypasses routing. Look at the
 database yourself:
 
 ```sh
-docker compose exec -T shard-03 psql -U shard -d shard -c "SELECT id, name FROM profiles WHERE id = 7"
+docker compose exec -T shard-03 psql -U shard -d shard -c "SELECT id, name FROM demo_profiles WHERE id = 7"
 ```
 
 ```text
@@ -94,7 +95,7 @@ docker compose exec -T shard-03 psql -U shard -d shard -c "SELECT id, name FROM 
 ```
 
 ```sh
-docker compose exec -T shard-01 psql -U shard -d shard -c "SELECT id, name FROM profiles WHERE id = 7"
+docker compose exec -T shard-01 psql -U shard -d shard -c "SELECT id, name FROM demo_profiles WHERE id = 7"
 ```
 
 ```text
@@ -124,8 +125,8 @@ go run ./examples/demo colocated 7
   op:        SELECT
   strategy:  single
   targets:   shard-03
-  reason:    routed by key: profiles.id has 1 key value(s) -> [shard-03]
-  shard sql: SELECT p.name, a.city FROM profiles p JOIN addresses a ON a.profile_id = p.id WHERE p.id = $1 ORDER BY a.city
+  reason:    routed by key: demo_profiles.id has 1 key value(s) -> [shard-03]
+  shard sql: SELECT p.name, a.city FROM demo_profiles p JOIN demo_addresses a ON a.profile_id = p.id WHERE p.id = $1 ORDER BY a.city
   name	city
   profile-07	Lisbon
   profile-07	Porto
@@ -187,8 +188,8 @@ go run ./examples/demo nokey
 ```
 
 ```text
-== SELECT id, name FROM profiles WHERE tier = 'gold'
-  refused: shard: no shard key: the query on "profiles" does not say which shard it belongs to; add `id = $n` or `id IN (...)` as an AND-ed condition, or use db.WithShardKey / db.WithAllShards
+== SELECT id, name FROM demo_profiles WHERE tier = 'gold'
+  refused: shard: no shard key: the query on "demo_profiles" does not say which shard it belongs to; add `id = $n` or `id IN (...)` as an AND-ed condition, or use db.WithShardKey / db.WithAllShards
 == the same query, asking for every shard on purpose
   gold profiles: 10
 ```
@@ -208,10 +209,10 @@ go run ./examples/demo tx
 ```text
 == a profile and its addresses in one transaction, then a failure
   transaction on shard-02
-  failed: shard shard-02: ERROR: duplicate key value violates unique constraint "addresses_pkey" (SQLSTATE 23505)
+  failed: shard shard-02: ERROR: duplicate key value violates unique constraint "demo_addresses_pkey" (SQLSTATE 23505)
   profiles with id 1001 afterwards: 0
 == a statement for another shard is refused
-  refused: shard: statement is outside the transaction's shard: the transaction is on shard-02 but this statement belongs to [shard-01] (INSERT of 1 row(s) by profiles.id -> [shard-01]); a transaction covers one shard, so keep rows that change together on one shard with colocation, or run this statement outside the transaction
+  refused: shard: statement is outside the transaction's shard: the transaction is on shard-02 but this statement belongs to [shard-01] (INSERT of 1 row(s) by demo_profiles.id -> [shard-01]); a transaction covers one shard, so keep rows that change together on one shard with colocation, or run this statement outside the transaction
   profiles with id 1002 afterwards: 0
 ```
 
@@ -227,7 +228,7 @@ transaction covers one shard. Nothing from either is kept.
 ## 6. A batch write when a shard is stopped
 
 This one stops `shard-02` for a few seconds with `docker compose stop` and
-starts it again afterwards, so run it on the shards from `make up`.
+starts it again afterwards, so it only runs on the shards from `make up` (it refuses when `SHARD_DSNS` is set).
 
 ```sh
 go run ./examples/demo batch
@@ -291,7 +292,7 @@ go run ./examples/demo migrate
   shard-02: 3
   shard-03: 3
   drift: yes
-  Up returned: migrate: migration failed: 1 of 3 shards failed: shard shard-01: migration 3: check constraint "profiles_name_length" of relation "profiles" is violated by some row (line 1)
+  Up returned: migrate: migration failed: 1 of 3 shards failed: shard shard-01: migration 3: check constraint "demo_profiles_name_length" of relation "demo_profiles" is violated by some row (line 1)
 ```
 
 The shard that holds the long name could not add the constraint. Its
@@ -346,7 +347,7 @@ go run ./examples/demo logs
 level=DEBUG msg="shard statement done" kind=query shard=shard-03
 level=DEBUG msg="shard statement" kind=query strategy=single targets=shard-03
 level=DEBUG msg="shard statement" kind=query strategy=all targets=shard-01,shard-02,shard-03
-level=ERROR msg="shard statement failed" kind=query error="shard: no shard key: the query on \"profiles\" does not say which shard it belongs to; add `id = $n` or `id IN (...)` as an AND-ed condition, or use db.WithShardKey / db.WithAllShards"
+level=ERROR msg="shard statement failed" kind=query error="shard: no shard key: the query on \"demo_profiles\" does not say which shard it belongs to; add `id = $n` or `id IN (...)` as an AND-ed condition, or use db.WithShardKey / db.WithAllShards"
 ```
 
 The hooks (`observe.Slog`) log one line per statement: what kind, which
@@ -397,8 +398,8 @@ A block marked `sh skip` is shown but not run.
 
 - `is make up running?` The shards are not reachable on ports 5441 to 5443.
   Run `make up`, and check that nothing else uses those ports.
-- `relation "profiles" already exists` while setting up: a table from something
-  else is in the way. `make demo-reset` replaces the demo tables.
+- `relation "demo_profiles" already exists` while setting up: an earlier run
+  left tables behind. `make demo-reset` replaces the demo tables.
 - Scenario 7 shows no failure: the migration was already applied. Run
   `make demo-reset` first.
 - A shard stays stopped after an interrupted scenario 6:

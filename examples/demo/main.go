@@ -5,8 +5,9 @@
 //
 // Run it without a command to list them. It uses the three local shards from
 // `make up` (set SHARD_DSNS, comma separated, to use others) and the tables
-// profiles, addresses and countries, plus demo_migrations and the idempotency
-// table. `make demo-setup` creates them and `make demo-reset` starts over.
+// demo_profiles, demo_addresses, demo_countries and demo_migrations (and the
+// idempotency table, which reset leaves alone). `make demo-setup` creates them
+// and `make demo-reset` starts over.
 //
 // Everything printed is the same on every run, so the guide's expected output
 // can be checked by CI.
@@ -113,9 +114,9 @@ func dsns() []string {
 
 func open(ctx context.Context, hooks observe.Hooks) (*shard.DB, error) {
 	reg, err := registry.New(
-		registry.Sharded("profiles", registry.Key("id"), registry.Type(registry.KeyInt)),
-		registry.Colocated("addresses", registry.With("profiles"), registry.Key("profile_id")),
-		registry.Global("countries"),
+		registry.Sharded("demo_profiles", registry.Key("id"), registry.Type(registry.KeyInt)),
+		registry.Colocated("demo_addresses", registry.With("demo_profiles"), registry.Key("profile_id")),
+		registry.Global("demo_countries"),
 	)
 	if err != nil {
 		return nil, err
@@ -163,8 +164,8 @@ func load(ctx context.Context, db *shard.DB) error {
 	}
 
 	// Rows are routed like any other write: each goes to the shard that owns its id.
-	p := query.InsertInto("profiles").Columns("id", "name", "tier", "score").OnConflictDoNothing()
-	a := query.InsertInto("addresses").Columns("id", "profile_id", "city").OnConflictDoNothing()
+	p := query.InsertInto("demo_profiles").Columns("id", "name", "tier", "score").OnConflictDoNothing()
+	a := query.InsertInto("demo_addresses").Columns("id", "profile_id", "city").OnConflictDoNothing()
 	tiers := []string{"bronze", "silver", "gold"}
 	cities := []string{"Lisbon", "Auckland", "Boston", "Porto"}
 	for id := int64(1); id <= profiles; id++ {
@@ -192,7 +193,7 @@ func reset(ctx context.Context, _ []string) error {
 	}
 	defer db.Close()
 	if _, err := db.WithAllShards().Exec(ctx,
-		"DROP TABLE IF EXISTS profiles, addresses, countries, "+migrationsTbl+", go_shard_idempotency_keys"); err != nil {
+		"DROP TABLE IF EXISTS demo_profiles, demo_addresses, demo_countries, "+migrationsTbl); err != nil {
 		return err
 	}
 	return load(ctx, db)
@@ -221,9 +222,15 @@ func printStatus(ctx context.Context, db *shard.DB) error {
 	fmt.Print(indent(st.String()))
 	fmt.Println("rows:")
 	for _, id := range db.Shards() {
-		fmt.Printf("  %s: %d profiles, %d addresses\n", id,
-			count(ctx, db.WithShard(id), "SELECT count(*) FROM profiles"),
-			count(ctx, db.WithShard(id), "SELECT count(*) FROM addresses"))
+		p, err := count(ctx, db.WithShard(id), "SELECT count(*) FROM demo_profiles")
+		if err != nil {
+			return err
+		}
+		a, err := count(ctx, db.WithShard(id), "SELECT count(*) FROM demo_addresses")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  %s: %d profiles, %d addresses\n", id, p, a)
 	}
 	return nil
 }
@@ -239,7 +246,7 @@ func where(ctx context.Context, args []string) error {
 	}
 	defer db.Close()
 
-	const sql = "SELECT name, tier, score FROM profiles WHERE id = $1"
+	const sql = "SELECT name, tier, score FROM demo_profiles WHERE id = $1"
 	fmt.Printf("== Explain: %s  [id = %d]\n", sql, id)
 	e, err := db.Explain(ctx, sql, id)
 	if err != nil {
@@ -254,8 +261,11 @@ func where(ctx context.Context, args []string) error {
 
 	fmt.Printf("== profiles with id %d, counted on every shard directly\n", id)
 	for _, sid := range db.Shards() {
-		fmt.Printf("  %s: %d\n", sid,
-			count(ctx, db.WithShard(sid), "SELECT count(*) FROM profiles WHERE id = $1", id))
+		n, err := count(ctx, db.WithShard(sid), "SELECT count(*) FROM demo_profiles WHERE id = $1", id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  %s: %d\n", sid, n)
 	}
 	return nil
 }
@@ -274,12 +284,18 @@ func colocated(ctx context.Context, args []string) error {
 	fmt.Printf("== profile %d and its addresses, on every shard\n", id)
 	for _, sid := range db.Shards() {
 		s := db.WithShard(sid)
-		fmt.Printf("  %s: %d profile, %d addresses\n", sid,
-			count(ctx, s, "SELECT count(*) FROM profiles WHERE id = $1", id),
-			count(ctx, s, "SELECT count(*) FROM addresses WHERE profile_id = $1", id))
+		p, err := count(ctx, s, "SELECT count(*) FROM demo_profiles WHERE id = $1", id)
+		if err != nil {
+			return err
+		}
+		a, err := count(ctx, s, "SELECT count(*) FROM demo_addresses WHERE profile_id = $1", id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  %s: %d profile, %d addresses\n", sid, p, a)
 	}
 
-	const sql = "SELECT p.name, a.city FROM profiles p JOIN addresses a ON a.profile_id = p.id WHERE p.id = $1 ORDER BY a.city"
+	const sql = "SELECT p.name, a.city FROM demo_profiles p JOIN demo_addresses a ON a.profile_id = p.id WHERE p.id = $1 ORDER BY a.city"
 	fmt.Println("== a join of the two, with the shard key in WHERE")
 	e, err := db.Explain(ctx, sql, id)
 	if err != nil {
@@ -298,10 +314,10 @@ func fanout(ctx context.Context, _ []string) error {
 	all := db.WithAllShards()
 
 	for _, q := range []struct{ title, sql string }{
-		{"the 5 highest scores", "SELECT id, name, score FROM profiles ORDER BY score DESC, id LIMIT 5"},
+		{"the 5 highest scores", "SELECT id, name, score FROM demo_profiles ORDER BY score DESC, id LIMIT 5"},
 		{"per tier: count, sum, min and max of the score",
-			"SELECT tier, count(*), sum(score), min(score), max(score) FROM profiles GROUP BY tier ORDER BY tier"},
-		{"everyone", "SELECT count(*), sum(score) FROM profiles"},
+			"SELECT tier, count(*), sum(score), min(score), max(score) FROM demo_profiles GROUP BY tier ORDER BY tier"},
+		{"everyone", "SELECT count(*), sum(score) FROM demo_profiles"},
 	} {
 		fmt.Printf("== %s\n", q.title)
 		e, err := all.Explain(ctx, q.sql)
@@ -326,7 +342,7 @@ func nokey(ctx context.Context, _ []string) error {
 	}
 	defer db.Close()
 
-	const sql = "SELECT id, name FROM profiles WHERE tier = 'gold'"
+	const sql = "SELECT id, name FROM demo_profiles WHERE tier = 'gold'"
 	fmt.Printf("== %s\n", sql)
 	_, err = db.Query(ctx, sql)
 	if !errors.Is(err, shard.ErrShardKeyRequired) {
@@ -334,7 +350,11 @@ func nokey(ctx context.Context, _ []string) error {
 	}
 	fmt.Printf("  refused: %v\n", firstLine(err))
 	fmt.Println("== the same query, asking for every shard on purpose")
-	fmt.Printf("  gold profiles: %d\n", count(ctx, db.WithAllShards(), "SELECT count(*) FROM profiles WHERE tier = 'gold'"))
+	n, err := count(ctx, db.WithAllShards(), "SELECT count(*) FROM demo_profiles WHERE tier = 'gold'")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  gold profiles: %d\n", n)
 	return nil
 }
 
@@ -347,25 +367,29 @@ func tx(ctx context.Context, _ []string) error {
 
 	const id = 1001
 	fmt.Println("== a profile and its addresses in one transaction, then a failure")
-	err = db.InTx(ctx, shard.ForTable("profiles", id), func(t shard.Tx) error {
+	err = db.InTx(ctx, shard.ForTable("demo_profiles", id), func(t shard.Tx) error {
 		fmt.Printf("  transaction on %s\n", t.Shard())
-		if _, err := t.Exec(ctx, "INSERT INTO profiles (id, name, tier, score) VALUES ($1, 'temp', 'bronze', 0)", id); err != nil {
+		if _, err := t.Exec(ctx, "INSERT INTO demo_profiles (id, name, tier, score) VALUES ($1, 'temp', 'bronze', 0)", id); err != nil {
 			return err
 		}
 		// The second address repeats an id, so the statement fails.
-		_, err := t.Exec(ctx, "INSERT INTO addresses (id, profile_id, city) VALUES (10010, $1, 'Lisbon'), (10010, $1, 'Porto')", id)
+		_, err := t.Exec(ctx, "INSERT INTO demo_addresses (id, profile_id, city) VALUES (10010, $1, 'Lisbon'), (10010, $1, 'Porto')", id)
 		return err
 	})
 	fmt.Printf("  failed: %v\n", firstLine(err))
-	fmt.Printf("  profiles with id %d afterwards: %d\n", id, count(ctx, db, "SELECT count(*) FROM profiles WHERE id = $1", id))
+	n, err := count(ctx, db, "SELECT count(*) FROM demo_profiles WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  profiles with id %d afterwards: %d\n", id, n)
 
 	fmt.Println("== a statement for another shard is refused")
 	other, err := idOnAnotherShard(ctx, db, id)
 	if err != nil {
 		return err
 	}
-	err = db.InTx(ctx, shard.ForTable("profiles", id), func(t shard.Tx) error {
-		_, err := t.Exec(ctx, "INSERT INTO profiles (id, name, tier, score) VALUES ($1, 'stray', 'bronze', 0)", other)
+	err = db.InTx(ctx, shard.ForTable("demo_profiles", id), func(t shard.Tx) error {
+		_, err := t.Exec(ctx, "INSERT INTO demo_profiles (id, name, tier, score) VALUES ($1, 'stray', 'bronze', 0)", other)
 		if !errors.Is(err, shard.ErrCrossShardTx) {
 			return fmt.Errorf("expected ErrCrossShardTx, got %v", err)
 		}
@@ -375,21 +399,46 @@ func tx(ctx context.Context, _ []string) error {
 	if !errors.Is(err, shard.ErrCrossShardTx) {
 		return err
 	}
-	fmt.Printf("  profiles with id %d afterwards: %d\n", other, count(ctx, db, "SELECT count(*) FROM profiles WHERE id = $1", other))
+	n, err = count(ctx, db, "SELECT count(*) FROM demo_profiles WHERE id = $1", other)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  profiles with id %d afterwards: %d\n", other, n)
 	return nil
 }
 
 func batch(ctx context.Context, _ []string) error {
+	if os.Getenv("SHARD_DSNS") != "" {
+		return errors.New("batch stops and starts the docker compose service " + stoppedShard + ", so it only runs against the shards from `make up`; unset SHARD_DSNS")
+	}
+
 	db, err := open(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	defer func() { // leave the dataset as it was
-		_, _ = db.WithAllShards().Exec(context.Background(), "DELETE FROM profiles WHERE id >= $1 AND id <= $2", batchFrom, batchTo)
+	// Leave the shards and the dataset as they were, whatever happens below:
+	// bring the shard back first, wait until it answers, then delete the rows.
+	stopped := false
+	defer func() {
+		bg, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if stopped {
+			if out, err := exec.Command("docker", "compose", "start", stoppedShard).CombinedOutput(); err != nil {
+				fmt.Fprintf(os.Stderr, "could not start %s again: %v\n%s", stoppedShard, err, out)
+				return
+			}
+			if err := waitHealthy(bg, db); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return
+			}
+		}
+		if _, err := db.WithAllShards().Exec(bg, "DELETE FROM demo_profiles WHERE id >= $1 AND id <= $2", batchFrom, batchTo); err != nil {
+			fmt.Fprintf(os.Stderr, "could not delete the batch rows: %v\n", err)
+		}
 	}()
 
-	b := query.InsertInto("profiles").Columns("id", "name", "tier", "score")
+	b := query.InsertInto("demo_profiles").Columns("id", "name", "tier", "score")
 	for id := int64(batchFrom); id <= batchTo; id++ {
 		b.Row(id, fmt.Sprintf("batch-%d", id), "bronze", 1)
 	}
@@ -403,7 +452,7 @@ func batch(ctx context.Context, _ []string) error {
 	if out, err := exec.Command("docker", "compose", "stop", stoppedShard).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose stop: %v\n%s", err, out)
 	}
-	defer func() { _ = exec.Command("docker", "compose", "start", stoppedShard).Run() }()
+	stopped = true
 
 	fmt.Printf("== one INSERT of %d profiles, ids %d to %d\n", batchTo-batchFrom+1, batchFrom, batchTo)
 	res, err := db.ExecStatement(shard.WithIdempotencyKey(ctx, key), st)
@@ -418,6 +467,7 @@ func batch(ctx context.Context, _ []string) error {
 	if out, err := exec.Command("docker", "compose", "start", stoppedShard).CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose start: %v\n%s", err, out)
 	}
+	stopped = false
 	if err := waitHealthy(ctx, db); err != nil {
 		return err
 	}
@@ -428,12 +478,16 @@ func batch(ctx context.Context, _ []string) error {
 		return err
 	}
 	showWrite(res)
-	n := count(ctx, db.WithAllShards(), "SELECT count(*) FROM profiles WHERE id >= $1 AND id <= $2", batchFrom, batchTo)
+	n, err := count(ctx, db.WithAllShards(), "SELECT count(*) FROM demo_profiles WHERE id >= $1 AND id <= $2", batchFrom, batchTo)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("  profiles %d to %d on all shards: %d\n", batchFrom, batchTo, n)
 	return nil
 }
 
-// bad names the shard that holds the over-long name; migration 3 fails there.
+// migrateBreak puts a profile with an over-long name on one shard; migration 3
+// cannot be applied there.
 func migrateBreak(ctx context.Context, _ []string) error {
 	db, err := open(ctx, nil)
 	if err != nil {
@@ -442,7 +496,7 @@ func migrateBreak(ctx context.Context, _ []string) error {
 	defer db.Close()
 
 	name := strings.Repeat("x", 40)
-	res, err := db.Exec(ctx, "INSERT INTO profiles (id, name, tier, score) VALUES ($1, $2, 'bronze', 0)", longNameID, name)
+	res, err := db.Exec(ctx, "INSERT INTO demo_profiles (id, name, tier, score) VALUES ($1, $2, 'bronze', 0)", longNameID, name)
 	if err != nil {
 		return err
 	}
@@ -498,7 +552,7 @@ func migrateFix(ctx context.Context, _ []string) error {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec(ctx, "DELETE FROM profiles WHERE id = $1", longNameID); err != nil {
+	if _, err := db.Exec(ctx, "DELETE FROM demo_profiles WHERE id = $1", longNameID); err != nil {
 		return err
 	}
 	fmt.Printf("removed profile %d\n", longNameID)
@@ -542,9 +596,9 @@ func logs(ctx context.Context, _ []string) error {
 	}
 	defer db.Close()
 
-	_ = drain(detailed.Query(ctx, "SELECT name FROM profiles WHERE id = $1", 7))
-	_ = drain(db.WithAllShards().Query(ctx, "SELECT id FROM profiles ORDER BY id LIMIT 3"))
-	_ = drain(db.Query(ctx, "SELECT name FROM profiles WHERE tier = 'gold'"))
+	_ = drain(detailed.Query(ctx, "SELECT name FROM demo_profiles WHERE id = $1", 7))
+	_ = drain(db.WithAllShards().Query(ctx, "SELECT id FROM demo_profiles ORDER BY id LIMIT 3"))
+	_ = drain(db.Query(ctx, "SELECT name FROM demo_profiles WHERE tier = 'gold'"))
 	return nil
 }
 
@@ -561,19 +615,21 @@ func idArg(args []string, def int64) (int64, error) {
 	return id, nil
 }
 
-func count(ctx context.Context, q shard.Querier, sql string, args ...any) int {
+// count runs a count(*) query. It returns the error rather than exiting, so
+// the caller's deferred cleanup still runs.
+func count(ctx context.Context, q shard.Querier, sql string, args ...any) (int, error) {
 	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
-		log.Fatal(err)
+		return 0, err
 	}
 	defer rows.Close()
 	var n int
 	if rows.Next() {
 		if err := rows.Scan(&n); err != nil {
-			log.Fatal(err)
+			return 0, err
 		}
 	}
-	return n
+	return n, rows.Err()
 }
 
 func drain(rows shard.Rows, err error) error {
@@ -651,7 +707,7 @@ func waitHealthy(ctx context.Context, db *shard.DB) error {
 // idOnAnotherShard finds an id that does not live on the same shard as id.
 func idOnAnotherShard(ctx context.Context, db *shard.DB, id int) (int, error) {
 	shardOf := func(k int) (shard.ShardID, error) {
-		t, err := db.Begin(ctx, shard.ForTable("profiles", k))
+		t, err := db.Begin(ctx, shard.ForTable("demo_profiles", k))
 		if err != nil {
 			return "", err
 		}

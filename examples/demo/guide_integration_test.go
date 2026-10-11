@@ -39,13 +39,13 @@ func TestDemoGuide(t *testing.T) {
 		t.Run(cmdline, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
+			ran++
 			cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)
 			cmd.Dir = "../.."
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("DEMO.md line %d: %v\n%s", b.line, err, out)
 			}
-			ran++
 
 			if i+1 >= len(blocks) || blocks[i+1].info != "text" {
 				return // only has to succeed
@@ -85,7 +85,11 @@ func readBlocks(t *testing.T, path string) []block {
 	for n := 1; sc.Scan(); n++ {
 		line := sc.Text()
 		switch {
-		case cur == nil && strings.HasPrefix(line, "```"):
+		case cur == nil && strings.HasPrefix(strings.TrimSpace(line), "```"):
+			// A fence this parser would skip is a block that is never checked.
+			if line != "```"+strings.TrimLeft(line, "`") || strings.HasPrefix(line, "````") {
+				t.Fatalf("%s line %d: keep fences at the left margin with exactly three backticks: %q", path, n, line)
+			}
 			cur = &block{info: strings.TrimSpace(strings.TrimPrefix(line, "```")), line: n}
 			body = nil
 		case cur != nil && line == "```":
