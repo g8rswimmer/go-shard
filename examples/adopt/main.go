@@ -126,7 +126,11 @@ func run() error {
 	if _, err := load(ctx, src, db, "ex_legacy.profiles", "ex_profiles", "id, name", "id"); err != nil {
 		return err
 	}
-	fmt.Printf("  profiles after a second run: %d\n", total(ctx, db, "SELECT count(*) FROM ex_profiles"))
+	again, err := total(ctx, db, "SELECT count(*) FROM ex_profiles")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  profiles after a second run: %d\n", again)
 
 	// 5. Check the result.
 	fmt.Println("\n== 3. verify")
@@ -138,7 +142,10 @@ func run() error {
 		if err := src.QueryRowContext(ctx, "SELECT count(*) FROM "+t.source).Scan(&want); err != nil {
 			return err
 		}
-		got := total(ctx, db, "SELECT count(*) FROM "+t.target)
+		got, err := total(ctx, db, "SELECT count(*) FROM "+t.target)
+		if err != nil {
+			return err
+		}
 		fmt.Printf("  %s: %d in the old database, %d on the shards\n", t.name, want, got)
 		if want != got {
 			return fmt.Errorf("%s: counts differ", t.name)
@@ -153,8 +160,12 @@ func run() error {
 	// its own (a subquery across shards is refused).
 	orphans := 0
 	for _, sid := range db.Shards() {
-		orphans += scalar(ctx, db.WithShard(sid), `SELECT count(*) FROM ex_addresses a
+		n, err := scalar(ctx, db.WithShard(sid), `SELECT count(*) FROM ex_addresses a
 			WHERE NOT EXISTS (SELECT 1 FROM ex_profiles p WHERE p.id = a.profile_id)`)
+		if err != nil {
+			return err
+		}
+		orphans += n
 	}
 	fmt.Printf("  addresses without their profile on the same shard: %d\n", orphans)
 	if misplaced != 0 || orphans != 0 {
@@ -187,8 +198,13 @@ func load(ctx context.Context, src *sql.DB, db *shard.DB, from, to, columns, key
 				rows.Close()
 				return copied, err
 			}
+			key, ok := vals[0].(int64) // the key is the first column
+			if !ok {
+				rows.Close()
+				return copied, fmt.Errorf("%s.%s is %T: this loader pages by an integer key; change it to page by yours", from, cols[0], vals[0])
+			}
 			b.Row(vals...)
-			last, _ = vals[0].(int64) // the key is the first column
+			last = key
 			n++
 		}
 		err = rows.Err()
@@ -211,23 +227,23 @@ func load(ctx context.Context, src *sql.DB, db *shard.DB, from, to, columns, key
 }
 
 // total runs a count(*) on every shard and adds them up.
-func total(ctx context.Context, db *shard.DB, sql string) int {
+func total(ctx context.Context, db *shard.DB, sql string) (int, error) {
 	return scalar(ctx, db.WithAllShards(), sql)
 }
 
-func scalar(ctx context.Context, q shard.Querier, sql string) int {
+func scalar(ctx context.Context, q shard.Querier, sql string) (int, error) {
 	rows, err := q.Query(ctx, sql)
 	if err != nil {
-		log.Fatal(err)
+		return 0, err
 	}
 	defer rows.Close()
 	var n int
 	if rows.Next() {
 		if err := rows.Scan(&n); err != nil {
-			log.Fatal(err)
+			return 0, err
 		}
 	}
-	return n
+	return n, rows.Err()
 }
 
 // misplacedRows asks each shard for its profile ids and checks that the router
