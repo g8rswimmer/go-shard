@@ -8,3 +8,6 @@ coverage.*
 .idea/
 .vscode/
 .DS_Store
+
+# Personal Claude Code settings
+.claude/settings.local.json

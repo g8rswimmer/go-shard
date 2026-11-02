@@ -1,10 +1,12 @@
 .DEFAULT_GOAL := help
-.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose bench bench-integration examples up down demo-setup demo-reset demo-check
+.PHONY: help build vet lint test test-nocgo test-integration test-integration-compose bench bench-integration examples up down demo-setup demo-reset demo-check check
 
 COMPOSE_DSNS := postgres://shard:shard@localhost:5441/shard?sslmode=disable,postgres://shard:shard@localhost:5442/shard?sslmode=disable,postgres://shard:shard@localhost:5443/shard?sslmode=disable
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
+
+check: build vet lint test test-nocgo ## Everything that must pass before a change is done (no Docker)
 
 build: ## Compile all packages
 	go build ./...

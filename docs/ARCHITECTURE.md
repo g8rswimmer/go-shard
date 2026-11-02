@@ -61,14 +61,14 @@ Dependency direction (arrows mean "imports"). Nothing imports the facade, and on
 ```
 shard -> plan, exec, merge, migrate, observe, query (optional), analyze/pgparse (cgo builds only)
 plan -> router, registry, analyze
-query -> analyze
-exec -> observe
-merge -> (types from plan/registry only)
+query -> analyze, merge
+exec -> observe, plan, router
+merge -> (nothing in this module)
 observe -> router (ShardID)
 observe/otel -> observe, OpenTelemetry
 migrate -> router (ShardID), golang-migrate
-analyze -> registry
-analyze/pgparse -> cgo (pg_query_go)
+analyze -> (nothing in this module)
+analyze/pgparse -> analyze, merge, cgo (pg_query_go)
 ```
 
 ## 3. Core types and interfaces

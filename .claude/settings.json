@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make vet)",
+      "Bash(make lint)",
+      "Bash(make test)",
+      "Bash(make test-nocgo)",
+      "Bash(make check)",
+      "Bash(make bench BENCHTIME=1x)",
+      "Bash(go build:*)",
+      "Bash(go vet:*)",
+      "Bash(go test:*)",
+      "Bash(golangci-lint run:*)",
+      "Bash(gofmt:*)"
+    ],
+    "ask": [
+      "Bash(make down)",
+      "Bash(make up)",
+      "Bash(make demo-setup)",
+      "Bash(make demo-reset)",
+      "Bash(make demo-check)",
+      "Bash(make test-integration:*)",
+      "Bash(make bench-integration:*)",
+      "Bash(make examples)",
+      "Bash(docker:*)",
+      "Bash(git push:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git commit --no-verify:*)"
+    ]
+  }
+}
