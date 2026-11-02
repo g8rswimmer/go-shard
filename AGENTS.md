@@ -34,7 +34,7 @@ Imports are within this module and checked with `go list`; keep the direction.
 | `shardtest/` | Public test support: containers, fake, assertions | root, `merge`, `migrate`, `query`, `registry` |
 | `examples/` | One runnable program per feature; `examples/demo` backs `docs/DEMO.md` | the public packages |
 
-How to make the common changes (route a new construct, add a merge function,
+Which document answers which question: [docs/README.md](docs/README.md). How to make the common changes (route a new construct, add a merge function,
 add an error or a hook event) is in [docs/CHANGING.md](docs/CHANGING.md). Decisions
 that are closed are in [docs/DECISIONS.md](docs/DECISIONS.md).
 

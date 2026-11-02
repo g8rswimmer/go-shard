@@ -78,6 +78,7 @@ go run ./examples/quickstart
 
 | | |
 |---|---|
+| [All documents, by question](docs/README.md) | Which document answers what |
 | [Examples](examples) | One runnable program per feature, each with its output |
 | [Adopting it with existing data](docs/ADOPTING.md) | Choosing keys, colocating tables, loading and verifying |
 | [Demo guide](docs/DEMO.md) | Try routing, fan-out, failures and migrations by hand against three local shards |

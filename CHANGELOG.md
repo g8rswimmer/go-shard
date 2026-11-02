@@ -37,7 +37,8 @@ The first release, v0.1.0, is being prepared (see
 - **Examples** for every feature, run against real PostgreSQL in CI.
 - **Guidance for contributors and coding agents:** `AGENTS.md` (code map,
   commands, scope, checklist), `docs/CHANGING.md` (how to make common changes),
-  `docs/DECISIONS.md`, and `make check`.
+  `docs/DECISIONS.md`, `docs/README.md` (an index by question), `make check`,
+  issue and PR templates, `CODEOWNERS` and `SECURITY.md`.
 - **Adoption guide** ([docs/ADOPTING.md](docs/ADOPTING.md)) and the
   `examples/adopt` loader: choosing shard keys, colocation, loading existing
   data and verifying it.
