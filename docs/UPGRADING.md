@@ -4,6 +4,22 @@ Notes for moving between releases. Each release that breaks something has a
 section here saying what changed and what to do. The rules for what may break,
 and when, are in [VERSIONING.md](VERSIONING.md).
 
+## v0.2.0
+
+Nothing to change in code that imports go-shard: no library code changed.
+
+If you ran the demo from v0.1.0 (`make demo-setup`), its tables were called
+`profiles`, `addresses` and `countries`. The demo now uses `demo_profiles`,
+`demo_addresses` and `demo_countries`, and `make demo-reset` no longer touches
+the old names. Remove the old ones from the throwaway shards when you want to:
+
+```sh
+docker compose exec -T shard-01 psql -U shard -d shard -c "DROP TABLE IF EXISTS profiles, addresses, countries"
+```
+
+(and the same for `shard-02` and `shard-03`). Only do this on the `make up`
+shards, where those tables came from the demo.
+
 ## v0.1.0
 
 The first release; there is nothing to upgrade from.

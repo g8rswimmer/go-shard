@@ -181,7 +181,7 @@ Release checklist for v0.1.0:
 - [ ] `docs/DEMO.md` completed end to end by someone other than its author, and its CI job passes.
 - [x] Supported/unsupported query reference and error reference published (M10: docs/QUERIES.md, docs/ERRORS.md).
 - [x] Benchmarks recorded (M10: docs/BENCHMARKS.md).
-- [ ] Changelog and tag.
+- [x] Changelog and tag (v0.1.0 on 2026-10-10; the changelog has dated entries for 0.1.0 and 0.2.0).
 
 ## 7. Suggested first steps
 
