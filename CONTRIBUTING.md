@@ -48,7 +48,7 @@ POSTGRES_VERSION=18 make up
 - Work on a branch, one milestone step per PR.
 - Add tests with the change: unit tests for logic, integration tests (build tag
   `integration`) for anything that talks to Postgres.
-- `make vet lint test` must pass. Every exported symbol needs a doc comment
+- `make check` must pass (build, vet, lint, tests with and without cgo). Every exported symbol needs a doc comment
   (the linter checks), and no test may leave a goroutine running (`goleak`).
 - Touching routing, merging or the executor: run `make bench` before and after,
   and record a meaningful change in `docs/BENCHMARKS.md`.
