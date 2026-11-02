@@ -21,7 +21,7 @@ and applies migrations to every shard.
   hooks give logs, OpenTelemetry traces and metrics; a fake lets you unit test
   without a database.
 
-> **Status:** pre-release (v0.1.0 is next). The API may still change before
+> **Status:** pre-1.0 (latest release: v0.2.0). The API may still change before
 > v1.0; see [versioning](docs/VERSIONING.md) and the [changelog](CHANGELOG.md).
 
 ## Install
